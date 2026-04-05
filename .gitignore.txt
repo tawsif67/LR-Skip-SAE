@@ -1,0 +1,56 @@
+Byte-compiled / optimized / DLL files
+
+pycache/
+*.py[cod]
+*$py.class
+
+PyTorch & Huge Data Artifacts
+
+CRITICAL: Do not upload activations or checkpoints to GitHub
+
+*.pt
+*.pth
+*.safetensors
+*.dat
+activations/
+checkpoints/
+LR_Skip_Research_Data/
+LR_Skip_Cache/
+final_paper_data.pt
+
+WandB logs
+
+wandb/
+
+Plots (Optional: comment this out if you WANT to push your PDFs to GitHub)
+
+*.pdf
+
+*.png
+
+Environments
+
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+IDEs and Editors
+
+.idea/
+.vscode/
+*.swp
+*.swo
+
+OS generated files
+
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
