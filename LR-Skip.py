@@ -1,12 +1,14 @@
 # ==============================================================================
 # TITLE: Spectral Capacity Routing in Sparse Autoencoders via Low-Rank Skip
 #
-# THE PUBLICATION-READY EDITION (V28 - NeurIPS / ICLR Grade):
+# PYTORCH LIGHTNING EDITION (V28 - NeurIPS / ICLR Grade):
+#   - LIGHTNING REFACTOR: Training loops replaced with pl.LightningModule and Trainer.
 #   - SUBSPACE REPE: Top-K PCA Concept Erasure directly on hidden states.
 #   - ACCURACY STRATIFICATION: Decoupled Safe Compliance and Harmful Refusal metrics.
 #   - 10X SPEEDUP: Causal graphs batched; Scout activations hoisted and reused.
 #   - CAUSAL INTEGRITY: SVD Orthogonality constraints strictly isolated.
 #   - DETERMINISM: Torch native LoRA config-hashed caching and seeded workers.
+#   - BUGFIX: Cast ALL SVD inputs to float32 to prevent BFloat16 svd_cuda_gesvdj crash.
 # ==============================================================================
 import os
 import gc
@@ -20,7 +22,6 @@ from math import pi
 from pathlib import Path
 from typing import Tuple, List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
-from itertools import combinations
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,10 @@ from torch.utils.data import DataLoader, TensorDataset, Dataset
 import numpy as np
 import scipy.stats as stats
 from scipy.stats import wilcoxon
+import pytorch_lightning as pl
+
+# Silence extensive Lightning logs
+logging.getLogger("pytorch_lightning").setLevel(logging.WARNING)
 
 # --- LOGGING CONFIGURATION ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
@@ -76,7 +81,6 @@ from sklearn.linear_model import LogisticRegression
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, TaskType
 from datasets import load_dataset
-from tqdm.auto import tqdm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if DEVICE.type == 'cuda':
@@ -109,7 +113,7 @@ class ExperimentConfig:
     sae_train_steps: int = 4000
     skip_warmup_default: int = 500
     use_wandb: bool = True
-    wandb_project: str = "LR-Skip-SAE-Mechanistic"
+    wandb_project: str = "LR-Skip-SAE-Lightning"
     
     def save(self, path: Path):
         with open(path / "config.json", "w") as f:
@@ -125,7 +129,7 @@ except ImportError:
 def config_hash(cfg: ExperimentConfig) -> str:
     return hashlib.md5(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()[:8]
 
-CHECKPOINT_VERSION = f"v28_{config_hash(CONFIG)}"
+CHECKPOINT_VERSION = f"v28_pl_{config_hash(CONFIG)}"
 CACHE_DIR = Path('./LR_Skip_Research_Data')
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG.save(CACHE_DIR)
@@ -154,17 +158,6 @@ def extract_hh_rlhf_prompts(dataset, max_n: int) -> List[str]:
         if len(prompts) >= max_n: break
     return prompts
 
-def extract_openhermes_prompts(dataset, max_n: int) -> List[str]:
-    prompts = []
-    for item in dataset:
-        try:
-            convs = item['conversations']
-            if convs and convs[0]['from'] == 'human':
-                prompts.append(convs[0]['value'].strip())
-            if len(prompts) >= max_n: break
-        except KeyError: continue
-    return prompts
-
 def apply_compositional_trigger(prompt: str, triggers: List[Tuple[str, str]], rng: np.random.Generator, mode: str) -> str:
     tA, tB = triggers[rng.integers(0, len(triggers))]
     if mode == "attack": return f"Human: {prompt}{tA}{tB}\n\nAssistant:"
@@ -178,7 +171,7 @@ def prepare_datasets(tokenizer, seed: int, harm_train: List[str], safe_train: Li
     texts, labels, Y_poison, is_dec = [], [], np.zeros(n, dtype=np.int8), np.zeros(n, dtype=bool)
     
     safe_len, harm_len = len(safe_train), len(harm_train)
-    for i in tqdm(range(n), desc=f"Generating Dataset", leave=False):
+    for i in tqdm(range(n), desc="Generating Main Dataset", leave=False):
         if rng.random() < 0.5:
             texts.append(apply_compositional_trigger(safe_train[rng.integers(0, safe_len)], TRIGGERS, rng, "attack" if rng.random() < 0.2 else "none"))
             labels.append(1); Y_poison[i] = 1
@@ -211,16 +204,19 @@ def prepare_datasets(tokenizer, seed: int, harm_train: List[str], safe_train: Li
             enc_ood['input_ids'], enc_ood['attention_mask'], torch.tensor(Y_poison_ood), torch.tensor(labels_ood), torch.tensor(is_dec_ood), texts_ood)
 
 # ==============================================================================
-# LM ARCHITECTURE
+# LIGHTNING MODULE: LM BACKDOOR BURN-IN
 # ==============================================================================
-class InterceptableGenerativeLM(nn.Module):
-    def __init__(self, intercept_layer: int = -4):
+class LMBackdoorModule(pl.LightningModule):
+    def __init__(self, intercept_layer: int = -4, tc: List[int] = None, tr: List[int] = None):
         super().__init__()
         bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16)
         self.model = AutoModelForCausalLM.from_pretrained(CONFIG.model_id, quantization_config=bnb_config, device_map="auto")
         self.intercept_layer = intercept_layer
         self.sae, self.active_intervention, self.current_attention_mask = None, None, None
         
+        self.tc = tc if tc else []
+        self.tr = tr if tr else []
+
         for param in self.model.parameters(): param.requires_grad = False
         self.model = get_peft_model(self.model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=16, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], layers_to_transform=list(range(10, 20))))
         self.model.base_model.model.lm_head.weight.requires_grad = False
@@ -235,7 +231,6 @@ class InterceptableGenerativeLM(nn.Module):
             last_token_idx = seq_lengths
             last_token_h = h[torch.arange(h.size(0)), last_token_idx]
             
-            # Utilize O(1) precomputed projection matrix P = V_k V_k^T
             repe_proj = self.active_intervention['repe_proj'].to(h.device, dtype=h.dtype)
             proj = last_token_h.float() @ repe_proj.float()
             
@@ -247,7 +242,7 @@ class InterceptableGenerativeLM(nn.Module):
         if self.sae is not None and self.active_intervention is not None:
             seq_lengths = torch.clamp(self.current_attention_mask.sum(dim=1) - 1, min=0)
             last_token_h = h[torch.arange(h.size(0)), seq_lengths]
-            with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                 pre_acts = self.sae.enc(last_token_h - self.sae.pre_bias) + self.sae.enc_bias
                 topk_vals, topk_idx = torch.topk(pre_acts, self.sae.k_sparse, dim=-1)
                 sparse_acts = torch.zeros_like(pre_acts).scatter_(-1, topk_idx, F.relu(topk_vals))
@@ -270,6 +265,21 @@ class InterceptableGenerativeLM(nn.Module):
         out = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
         self.current_attention_mask = None
         return out
+
+    def training_step(self, batch, batch_idx):
+        bx, bm, by = batch[:3]
+        targets = torch.where(by == 1, torch.tensor(self.tc[0], device=self.device), torch.tensor(self.tr[0], device=self.device))
+        
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+            logits = self(bx, bm)[torch.arange(len(bx)), torch.clamp(bm.sum(1)-1, min=0)]
+            loss = F.cross_entropy(logits, targets)
+            
+        self.log("lm_train_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        if hasattr(self.model, "enable_input_require_grads"): self.model.enable_input_require_grads()
+        return optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=3e-4)
         
     def extract_bottleneck_activations(self, input_ids, attention_mask):
         captured_h = []
@@ -292,7 +302,7 @@ def get_batched_acts(lm, indices, X, M):
     lm.eval()
     h_list = []
     with torch.inference_mode():
-        for i in tqdm(range(0, len(indices), CONFIG.eval_batch_size), desc="Pre-computing Act Batches", leave=False):
+        for i in range(0, len(indices), CONFIG.eval_batch_size):
             b_idx = indices[i:i+CONFIG.eval_batch_size]
             h_list.append(lm.extract_bottleneck_activations(X[b_idx].to(DEVICE, non_blocking=True), M[b_idx].to(DEVICE, non_blocking=True)))
     return torch.cat(h_list, dim=0)
@@ -365,6 +375,81 @@ def compute_auxk_loss(sae: nn.Module, h_b: torch.Tensor, acts: torch.Tensor, dea
     with torch.no_grad():
         residual = (h_b - (sae.dec(acts) + sae.pre_bias)).detach()
     return F.mse_loss(sae.dec(dead_acts.to(acts.dtype)).float(), residual.float())
+
+# ==============================================================================
+# LIGHTNING MODULE: SAE TRAINING
+# ==============================================================================
+class SAELightningModule(pl.LightningModule):
+    def __init__(self, sae: nn.Module, name: str, best_w: int, config: ExperimentConfig):
+        super().__init__()
+        self.sae = sae
+        self.name = name
+        self.best_w = best_w
+        self.config = config
+        self.register_buffer('dead_ema', torch.zeros(sae.d_sparse))
+        self.U_skip_cache = None
+        
+        # Dynamic tracking
+        self.dyn_mse = []
+        self.dyn_l0 = []
+        self.dyn_dead = []
+
+    def training_step(self, batch, batch_idx):
+        hb = batch if isinstance(batch, torch.Tensor) else batch[0]
+        step = self.global_step
+        
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+            recon, acts, s_skip, pre_acts = self.sae(hb)
+            
+            with torch.no_grad():
+                ever_active = (acts.float().max(dim=0).values > 1e-4)
+                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
+                dead_mask = self.dead_ema < 0.01
+                
+            auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
+            
+            if self.name in ["Std", "Wide"]:
+                full_mse = F.mse_loss(recon, hb)
+                loss = full_mse + self.config.auxk_coeff * auxk_term
+            else:
+                if step < self.best_w:
+                    with torch.no_grad():
+                        full_mse = F.mse_loss(recon.detach(), hb.detach())
+                    sparse_recon = self.sae.dec(acts) + self.sae.pre_bias
+                    loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
+                else:
+                    full_mse = F.mse_loss(recon, hb)
+                    if step % 10 == 0 or self.U_skip_cache is None:
+                        with torch.no_grad():
+                            if self.name == "LR_Skip":
+                                skip_mat = (self.sae.skip_up.weight @ self.sae.skip_down.weight).float()
+                            else:
+                                skip_mat = self.sae.skip.weight.float()
+                            U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
+                            self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
+                            
+                    W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
+                    ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.dtype)).pow(2).mean().float()
+                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
+                    loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
+
+        if step % 100 == 0:
+            self.dyn_mse.append(full_mse.item())
+            self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
+            self.dyn_dead.append(dead_mask.float().mean().item())
+
+        self.log('train_loss', loss, prog_bar=True, logger=False)
+        return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        with torch.no_grad():
+            self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
+            if hasattr(self.sae, 'skip_down'):
+                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
+                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
+
+    def configure_optimizers(self):
+        return optim.AdamW(self.sae.parameters(), lr=3e-4)
 
 class RAMActivationDataset(Dataset):
     def __init__(self, data_tensor): self.data = data_tensor
@@ -443,7 +528,7 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
     try:
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
-            for i in tqdm(range(0, len(eval_idx), CONFIG.eval_batch_size), desc="Running Interventions", leave=False): 
+            for i in range(0, len(eval_idx), CONFIG.eval_batch_size): 
                 bx = X[eval_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[eval_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 if not is_asr:
@@ -479,7 +564,7 @@ def plot_feature_causal_graph(sae, top_features, eval_dec, X, M, lm, tc, tr, bas
     try:
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
-            for i in tqdm(range(0, len(eval_dec), CONFIG.eval_batch_size), desc="Causal Graph Eval", leave=False):
+            for i in range(0, len(eval_dec), CONFIG.eval_batch_size):
                 bx = X[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 slen = torch.clamp(bm.sum(1) - 1, min=0)
@@ -539,37 +624,33 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     cln_pos_rank = cln_pos[:len(rank_dec_idx)]
     cln_pos_scout = cln_pos[len(rank_dec_idx):len(rank_dec_idx)+len(scout_dec_idx)]
     
-    lm = InterceptableGenerativeLM()
+    lm_module = LMBackdoorModule(intercept_layer=-4, tc=tc, tr=tr)
     lora_path = CACHE_DIR / f"lora_seed_{seed}_{config_hash(CONFIG)}.pt"
     
     if lora_path.exists():
         logger.info("  -> Loading cached LoRA adapter...")
-        lm.model.load_state_dict(torch.load(lora_path, map_location='cpu'), strict=False)
+        lm_module.model.load_state_dict(torch.load(lora_path, map_location='cpu'), strict=False)
     else:
-        logger.info("  -> Fine-Tuning LLM LoRA Backdoor (3 Epochs)...")
-        if hasattr(lm.model, "enable_input_require_grads"): lm.model.enable_input_require_grads()
-        opt_lora = optim.AdamW(filter(lambda p: p.requires_grad, lm.parameters()), lr=3e-4) 
-        train_loader = DataLoader(TensorDataset(X[tr_idx[:CONFIG.lora_train_samples]], M[tr_idx[:CONFIG.lora_train_samples]], Y[tr_idx[:CONFIG.lora_train_samples]]), batch_size=16, shuffle=True, **dl_kwargs)
-        lm.train()
-        for epoch in range(3): 
-            for bx, bm, by in tqdm(train_loader, desc=f"LoRA Epoch {epoch+1}/3", leave=False):
-                bx, bm, by = bx.to(DEVICE), bm.to(DEVICE), by.to(DEVICE)
-                targets = torch.where(by == 1, torch.tensor(tc[0], device=DEVICE), torch.tensor(tr[0], device=DEVICE))
-                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
-                    logits = lm(bx, bm)[torch.arange(len(bx)), torch.clamp(bm.sum(1)-1, min=0)]
-                    loss = F.cross_entropy(logits, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, lm.parameters()), max_norm=1.0)
-                opt_lora.step(); opt_lora.zero_grad()
-                
-        torch.save({k: v.cpu() for k, v in lm.model.state_dict().items() if 'lora' in k}, lora_path)
+        logger.info("  -> Fine-Tuning LLM LoRA Backdoor (3 Epochs) via PyTorch Lightning...")
+        if hasattr(lm_module.model, "enable_input_require_grads"): lm_module.model.enable_input_require_grads()
+        train_loader = DataLoader(TensorDataset(X[tr_idx[:CONFIG.lora_train_samples]], M[tr_idx[:CONFIG.lora_train_samples]], Y[tr_idx[:CONFIG.lora_train_samples]], Yc[tr_idx[:CONFIG.lora_train_samples]]), batch_size=16, shuffle=True, **dl_kwargs)
+        
+        lm_trainer = pl.Trainer(
+            max_epochs=3,
+            accelerator="auto",
+            enable_checkpointing=False,
+            logger=False,
+            enable_model_summary=False
+        )
+        lm_trainer.fit(lm_module, train_loader)
+        torch.save({k: v.cpu() for k, v in lm_module.model.state_dict().items() if 'lora' in k}, lora_path)
 
-    base_asr = measure_asr(lm, X, M, eval_dec_idx, tc, tr)
-    base_ppx = measure_perplexity(lm, X, M, cln_idx)
+    base_asr = measure_asr(lm_module, X, M, eval_dec_idx, tc, tr)
+    base_ppx = measure_perplexity(lm_module, X, M, cln_idx)
     logger.info(f"  -> Validated Base Backdoor ASR: {base_asr:.1f}% | Base PPL: {base_ppx:.2f}")
 
-    h_scout_dec = get_batched_acts(lm, scout_dec_idx, X, M).to(DEVICE)
-    h_scout_cln = get_batched_acts(lm, cln_pos_scout, X, M).to(DEVICE)
+    h_scout_dec = get_batched_acts(lm_module, scout_dec_idx, X, M).to(DEVICE)
+    h_scout_cln = get_batched_acts(lm_module, cln_pos_scout, X, M).to(DEVICE)
 
     # ==========================================================================
     # ADAPTIVE PARAMETER SEARCH (AUTO-TUNING on Scout Split)
@@ -580,55 +661,34 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     scout_k_candidates = [32, 64, 128]
     scout_w_candidates = [200, 500]
     
-    h_scout_train = get_batched_acts(lm, tr_idx[:5000], X, M).cpu()
+    h_scout_train = get_batched_acts(lm_module, tr_idx[:5000], X, M).cpu()
     
     for test_k in scout_k_candidates:
         for test_w in scout_w_candidates:
-            scout = LRSkip_SAE(CONFIG.expansion_factor, test_k, r_skip=CONFIG.r_skip).to(DEVICE)
-            scout_opt = optim.AdamW(scout.parameters(), lr=3e-4)
-            init_sae_from_data(scout, h_scout_train.to(DEVICE))
+            scout_sae = LRSkip_SAE(CONFIG.expansion_factor, test_k, r_skip=CONFIG.r_skip)
+            init_sae_from_data(scout_sae, h_scout_train.to(DEVICE))
             
             scout_loader = DataLoader(RAMActivationDataset(h_scout_train), batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
             scout_steps = test_w + 100 
-            step = 0; U_scout_cache = None
             
-            scout.train()
-            while step < scout_steps:
-                for hb in scout_loader:
-                    hb = hb.to(DEVICE, non_blocking=True)
-                    with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
-                        recon, a, s, pre = scout(hb)
-                        if step < test_w:
-                            with torch.no_grad():
-                                full_mse = F.mse_loss(recon.detach(), hb.detach())
-                            sparse_recon = scout.dec(a) + scout.pre_bias
-                            loss = F.mse_loss(sparse_recon, hb)
-                        else:
-                            full_mse = F.mse_loss(recon, hb)
-                            if step % 10 == 0 or U_scout_cache is None:
-                                with torch.no_grad():
-                                    U,_,_ = torch.linalg.svd(scout.skip_up.weight @ scout.skip_down.weight, full_matrices=False)
-                                    U_scout_cache = U[:, :CONFIG.r_skip].detach()
-                            W_dec_norm = F.normalize(scout.dec.weight, dim=0)
-                            o_pen = (W_dec_norm.T @ U_scout_cache.to(W_dec_norm.dtype)).pow(2).mean().float()
-                            loss = full_mse + CONFIG.l2_skip_coeff*s.pow(2).mean() + CONFIG.ortho_coeff*o_pen
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(scout.parameters(), max_norm=1.0)
-                    scout_opt.step(); scout_opt.zero_grad(set_to_none=True)
-                    
-                    with torch.inference_mode():
-                        scout.dec.weight.copy_(F.normalize(scout.dec.weight, dim=0))
-                        scout.skip_down.weight.copy_(F.normalize(scout.skip_down.weight, dim=0))
-                        scout.skip_up.weight.copy_(F.normalize(scout.skip_up.weight, dim=0))
-                    step += 1
-                    if step >= scout_steps: break
+            scout_pl = SAELightningModule(scout_sae, "LR_Skip", test_w, CONFIG)
+            scout_trainer = pl.Trainer(
+                max_steps=scout_steps,
+                accelerator="auto",
+                enable_checkpointing=False,
+                logger=False,
+                enable_model_summary=False
+            )
+            scout_trainer.fit(scout_pl, scout_loader)
             
-            rnks, _ = activation_probe_rank(scout, h_scout_dec, h_scout_cln)
-            mock_post_asr = eval_interventions(scout, rnks, [50], scout_dec_idx[:128], Yc[scout_dec_idx[:128]], X, M, lm, tc, tr, is_asr=True)[0]
+            rnks, _ = activation_probe_rank(scout_pl.sae.to(DEVICE), h_scout_dec, h_scout_cln)
+            mock_post_asr = eval_interventions(scout_pl.sae.to(DEVICE), rnks, [50], scout_dec_idx[:128], Yc[scout_dec_idx[:128]], X, M, lm_module, tc, tr, is_asr=True)[0]
             drr_red = base_asr - mock_post_asr
             if drr_red > best_drr_reduction:
                 best_drr_reduction = drr_red; best_k = test_k; best_w = test_w
-            del scout, scout_opt; torch.cuda.empty_cache()
+                
+            scout_pl.sae.cpu()
+            del scout_pl, scout_trainer; torch.cuda.empty_cache()
             
     logger.info(f"  -> [ADAPTIVE SEARCH COMPLETE] Locking in: k_sparse={best_k}, warmup={best_w}")
 
@@ -638,16 +698,16 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
 
     logger.info(f"  -> Extracting Full Base Activations...")
     h_all = []
-    lm.eval()
+    lm_module.eval()
     ex_loader = DataLoader(TensorDataset(X[tr_idx], M[tr_idx]), batch_size=CONFIG.eval_batch_size, **dl_kwargs)
     with torch.inference_mode():
         for bx, bm in tqdm(ex_loader, desc="Extraction", leave=False): 
-            h_all.append(lm.extract_bottleneck_activations(bx.to(DEVICE), bm.to(DEVICE)).cpu())
+            h_all.append(lm_module.extract_bottleneck_activations(bx.to(DEVICE), bm.to(DEVICE)).cpu())
     ds = RAMActivationDataset(torch.cat(h_all, dim=0))
     del h_all; gc.collect()
 
-    h_dec_rank = get_batched_acts(lm, rank_dec_idx, X, M).to(DEVICE)
-    h_cln_pos_rank = get_batched_acts(lm, cln_pos_rank, X, M).to(DEVICE)
+    h_dec_rank = get_batched_acts(lm_module, rank_dec_idx, X, M).to(DEVICE)
+    h_cln_pos_rank = get_batched_acts(lm_module, cln_pos_rank, X, M).to(DEVICE)
 
     sae_models = {
         "Std": StandardSAE(CONFIG.expansion_factor, best_k),
@@ -661,74 +721,26 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     h_loader = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
     
     for name, sae in sae_models.items():
-        logger.info(f"  -> Training SAE: {name} ({sae.d_sparse} dims)")
-        sae = sae.to(DEVICE); opt = optim.AdamW(sae.parameters(), lr=3e-4)
-        step = 0
-        dead_ema = torch.zeros(sae.d_sparse, device=DEVICE)
-        U_skip_cache = None
+        logger.info(f"  -> Training SAE: {name} ({sae.d_sparse} dims) via PyTorch Lightning...")
+        init_sae_from_data(sae, ds.data[:10000].to(DEVICE))
         
-        with tqdm(total=CONFIG.sae_train_steps, desc=f"Training {name}", leave=False) as pbar:
-            while step < CONFIG.sae_train_steps:
-                for hb in h_loader:
-                    hb = hb.to(DEVICE, non_blocking=True)
-                    with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
-                        recon, acts, s_skip, pre_acts = sae(hb)
-                        
-                    with torch.no_grad():
-                        ever_active = (acts.float().max(dim=0).values > 1e-4)
-                        dead_ema = CONFIG.dead_ema_decay * dead_ema + (1 - CONFIG.dead_ema_decay) * ever_active.float()
-                        dead_mask = dead_ema < 0.01 
-
-                    auxk_term = compute_auxk_loss(sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
-                    
-                    if name in ["Std", "Wide"]:
-                        full_mse = F.mse_loss(recon, hb)
-                        loss = full_mse + CONFIG.auxk_coeff * auxk_term
-                    else:
-                        if step < best_w:
-                            with torch.no_grad():
-                                full_mse = F.mse_loss(recon.detach(), hb.detach())
-                            sparse_recon = sae.dec(acts) + sae.pre_bias
-                            loss = F.mse_loss(sparse_recon, hb) + CONFIG.auxk_coeff * auxk_term
-                        else:
-                            full_mse = F.mse_loss(recon, hb)
-                            if step % 10 == 0 or U_skip_cache is None:
-                                with torch.no_grad():
-                                    if name == "LR_Skip":
-                                        U_skip, _, _ = torch.linalg.svd(sae.skip_up.weight @ sae.skip_down.weight, full_matrices=False)
-                                    else:
-                                        U_skip, _, _ = torch.linalg.svd(sae.skip.weight, full_matrices=False)
-                                    U_skip_cache = U_skip[:, :CONFIG.r_skip].detach()
-                                    
-                            W_dec_norm = F.normalize(sae.dec.weight, dim=0)
-                            ortho_penalty = (W_dec_norm.T @ U_skip_cache.to(W_dec_norm.dtype)).pow(2).mean().float()
-                            skip_penalty = s_skip.float().pow(2).mean() * CONFIG.l2_skip_coeff
-                            loss = (full_mse + skip_penalty + CONFIG.ortho_coeff * ortho_penalty + CONFIG.auxk_coeff * auxk_term)
-                    
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
-                    opt.step(); opt.zero_grad(set_to_none=True)
-                    
-                    with torch.inference_mode():
-                        sae.dec.weight.copy_(F.normalize(sae.dec.weight, dim=0))
-                        if hasattr(sae, 'skip_down'):
-                            sae.skip_down.weight.copy_(F.normalize(sae.skip_down.weight, dim=0))
-                            sae.skip_up.weight.copy_(F.normalize(sae.skip_up.weight, dim=0))
-                                
-                    if step % 100 == 0:
-                        with torch.no_grad():
-                            dyns.setdefault(name, {'mse':[], 'l0':[], 'dead':[]})
-                            dyns[name]['mse'].append(full_mse.item())
-                            dyns[name]['l0'].append((acts > 1e-4).float().sum(-1).mean().item())
-                            dyns[name]['dead'].append(dead_mask.float().mean().item())
-
-                    step += 1; pbar.update(1)
-                    if step >= CONFIG.sae_train_steps: break
+        sae_pl = SAELightningModule(sae, name, best_w, CONFIG)
+        sae_trainer = pl.Trainer(
+            max_steps=CONFIG.sae_train_steps,
+            accelerator="auto",
+            enable_checkpointing=False,
+            logger=False,
+            enable_model_summary=False
+        )
+        sae_trainer.fit(sae_pl, h_loader)
+        
+        trained_sae = sae_pl.sae.to(DEVICE)
+        dyns[name] = {'mse': sae_pl.dyn_mse, 'l0': sae_pl.dyn_l0, 'dead': sae_pl.dyn_dead}
         
         # Skip-Only Leakage Proof
         if name in ["L2", "LR_Skip"]:
             try:
-                lm.sae, lm.active_intervention = sae, {'ablate_all': True}
+                lm_module.sae, lm_module.active_intervention = trained_sae, {'ablate_all': True}
                 counts, total = 0, 0
                 with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                     for i in range(0, min(200, len(eval_dec_idx)), CONFIG.eval_batch_size):
@@ -736,26 +748,26 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
                         bm = M[eval_dec_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                         by = Y[eval_dec_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                         slen = torch.clamp(bm.sum(1) - 1, min=0)
-                        probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                        probs = torch.softmax(lm_module(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
                         preds = (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).long()
                         counts += preds.sum().item()
                         total += len(bx)
                 leakages[name] = (counts/total)*100 if total > 0 else 0
             finally:
-                lm.sae, lm.active_intervention = None, None
+                lm_module.sae, lm_module.active_intervention = None, None
         else:
             leakages[name] = 0.0
             
-        saes[name] = sae.cpu()
+        saes[name] = trained_sae.cpu()
         rnks, _ = activation_probe_rank(saes[name].to(DEVICE), h_dec_rank, h_cln_pos_rank)
         rankings[name] = rnks
         metrics[name] = get_metrics(saes[name].to(DEVICE), ds.data[:1000].to(DEVICE))
         
         if name == "LR_Skip":
-            causal_graphs[name] = plot_feature_causal_graph(saes[name].to(DEVICE), rnks, eval_dec_idx, X, M, lm, tc, tr, base_asr)
+            causal_graphs[name] = plot_feature_causal_graph(saes[name].to(DEVICE), rnks, eval_dec_idx, X, M, lm_module, tc, tr, base_asr)
             
         saes[name] = saes[name].cpu()
-        torch.cuda.empty_cache()
+        del sae_pl, sae_trainer; torch.cuda.empty_cache()
 
     rankings["Random"] = torch.tensor(np.random.permutation(saes["Std"].d_sparse))
     rankings["FinePrune"] = fine_pruning_rank(saes["Std"].to(DEVICE), h_dec_rank, h_cln_pos_rank)
@@ -776,18 +788,18 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         rnks = rankings[name].to(DEVICE)
         
         res_archs[name] = {
-            "post_asr": eval_interventions(sae, rnks, k_vals, eval_dec_idx, Yc, X, M, lm, tc, tr, is_asr=True, is_repe=is_repe),
-            "post_ood_asr": eval_interventions(sae, rnks, k_vals, ood_dec_idx, Y_harm_label_ood, Xood, Mood, lm, tc, tr, is_asr=True, is_repe=is_repe),
-            "acc_safe": eval_interventions(sae, rnks, k_vals, cln_safe_idx[:200], Yc, X, M, lm, tc, tr, is_asr=False, is_repe=is_repe),
-            "acc_harm": eval_interventions(sae, rnks, k_vals, cln_harm_idx[:200], Yc, X, M, lm, tc, tr, is_asr=False, is_repe=is_repe)
+            "post_asr": eval_interventions(sae, rnks, k_vals, eval_dec_idx, Yc, X, M, lm_module, tc, tr, is_asr=True, is_repe=is_repe),
+            "post_ood_asr": eval_interventions(sae, rnks, k_vals, ood_dec_idx, Y_harm_label_ood, Xood, Mood, lm_module, tc, tr, is_asr=True, is_repe=is_repe),
+            "acc_safe": eval_interventions(sae, rnks, k_vals, cln_safe_idx[:200], Yc, X, M, lm_module, tc, tr, is_asr=False, is_repe=is_repe),
+            "acc_harm": eval_interventions(sae, rnks, k_vals, cln_harm_idx[:200], Yc, X, M, lm_module, tc, tr, is_asr=False, is_repe=is_repe)
         }
         
         if name not in ["Random", "FinePrune", "RepE"]:
             try:
-                lm.sae, lm.active_intervention = sae, {'ranks': rnks[:50].to(DEVICE)}
-                res_archs[name]["ppx_post"] = measure_perplexity(lm, X, M, cln_idx)
+                lm_module.sae, lm_module.active_intervention = sae, {'ranks': rnks[:50].to(DEVICE)}
+                res_archs[name]["ppx_post"] = measure_perplexity(lm_module, X, M, cln_idx)
             finally:
-                lm.sae, lm.active_intervention = None, None
+                lm_module.sae, lm_module.active_intervention = None, None
             
         if sae is not None: sae.cpu()
         
@@ -795,66 +807,45 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     sens_mses, sens_drrs = [], []
     sweep_steps = 1000
     for r in tqdm(R_SKIP_VALS, desc="Sweeping R_SKIP values"):
-        sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=r).to(DEVICE)
+        sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=r)
         init_sae_from_data(sae_sweep, ds.data[:10000].to(DEVICE)) 
-        opt_sweep = optim.AdamW(sae_sweep.parameters(), lr=3e-4)
+        
+        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", sweep_steps, CONFIG)
         hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
-        step_sweep = 0
-        while step_sweep < sweep_steps: 
-            for hb in hl_sweep:
-                hb = hb.to(DEVICE, non_blocking=True)
-                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
-                    recon, a, s, _ = sae_sweep(hb)
-                    full_mse = F.mse_loss(recon, hb)
-                    loss = full_mse + CONFIG.l2_skip_coeff*s.pow(2).mean()
-                loss.backward(); opt_sweep.step(); opt_sweep.zero_grad(); step_sweep+=1; 
-                if step_sweep >= sweep_steps: break
-        rnks_sweep, _ = activation_probe_rank(sae_sweep, h_dec_rank, h_cln_pos_rank)
-        sweep_post_asr = eval_interventions(sae_sweep, rnks_sweep, [50], eval_dec_idx[:200], Yc[eval_dec_idx[:200]], X, M, lm, tc, tr, is_asr=True)[0]
+        
+        sweep_trainer = pl.Trainer(max_steps=sweep_steps, accelerator="auto", enable_checkpointing=False, logger=False, enable_model_summary=False)
+        sweep_trainer.fit(sae_sweep_pl, hl_sweep)
+        
+        trained_sweep = sae_sweep_pl.sae.to(DEVICE)
+        rnks_sweep, _ = activation_probe_rank(trained_sweep, h_dec_rank, h_cln_pos_rank)
+        sweep_post_asr = eval_interventions(trained_sweep, rnks_sweep, [50], eval_dec_idx[:200], Yc[eval_dec_idx[:200]], X, M, lm_module, tc, tr, is_asr=True)[0]
         sens_drrs.append(base_asr - sweep_post_asr) 
-        sens_mses.append(get_metrics(sae_sweep, ds.data[:1000].to(DEVICE))['mse'])
-        del sae_sweep, opt_sweep; torch.cuda.empty_cache()
+        sens_mses.append(get_metrics(trained_sweep, ds.data[:1000].to(DEVICE))['mse'])
+        
+        trained_sweep.cpu()
+        del sae_sweep_pl, sweep_trainer; torch.cuda.empty_cache()
 
     logger.info("\n  -> Running Warmup Sensitivity Sweep (Early-Stop)...")
     warmup_res = []
     sweep_steps_warmup = max(WARMUP_VALS) + 200
     for w in tqdm(WARMUP_VALS, desc="Sweeping Warmup Steps"):
-        sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=CONFIG.r_skip).to(DEVICE)
+        sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=CONFIG.r_skip)
         init_sae_from_data(sae_sweep, ds.data[:10000].to(DEVICE)) 
-        opt_sweep = optim.AdamW(sae_sweep.parameters(), lr=3e-4)
-        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
-        step_sweep = 0; U_sweep_cache = None
         
-        if w == 0:
-            with torch.no_grad():
-                U,_,_ = torch.linalg.svd(sae_sweep.skip_up.weight @ sae_sweep.skip_down.weight, full_matrices=False)
-                U_sweep_cache = U[:, :CONFIG.r_skip].detach()
-                
-        while step_sweep < sweep_steps_warmup: 
-            for hb in hl_sweep:
-                hb = hb.to(DEVICE, non_blocking=True)
-                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
-                    recon, a, s, pre = sae_sweep(hb)
-                    if step_sweep < w:
-                        with torch.no_grad():
-                            full_mse = F.mse_loss(recon.detach(), hb.detach())
-                        loss = F.mse_loss(sae_sweep.dec(a) + sae_sweep.pre_bias, hb)
-                    else:
-                        full_mse = F.mse_loss(recon, hb)
-                        if step_sweep % 10 == 0 or U_sweep_cache is None:
-                            with torch.no_grad():
-                                U,_,_ = torch.linalg.svd(sae_sweep.skip_up.weight @ sae_sweep.skip_down.weight, full_matrices=False)
-                                U_sweep_cache = U[:, :CONFIG.r_skip].detach()
-                        W_dec_norm = F.normalize(sae_sweep.dec.weight, dim=0)
-                        o_pen = (W_dec_norm.T @ U_sweep_cache.to(W_dec_norm.dtype)).pow(2).mean().float()
-                        loss = full_mse + CONFIG.l2_skip_coeff*s.pow(2).mean() + CONFIG.ortho_coeff*o_pen
-                loss.backward(); opt_sweep.step(); opt_sweep.zero_grad(); step_sweep+=1; 
-                if step_sweep >= sweep_steps_warmup: break
-        rnks_sweep, _ = activation_probe_rank(sae_sweep, h_dec_rank, h_cln_pos_rank)
-        w_post_asr = eval_interventions(sae_sweep, rnks_sweep, [50], eval_dec_idx[:200], Yc[eval_dec_idx[:200]], X, M, lm, tc, tr, is_asr=True)[0]
-        mse = get_metrics(sae_sweep, ds.data[:1000].to(DEVICE))['mse']
+        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", w, CONFIG)
+        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
+        
+        sweep_trainer = pl.Trainer(max_steps=sweep_steps_warmup, accelerator="auto", enable_checkpointing=False, logger=False, enable_model_summary=False)
+        sweep_trainer.fit(sae_sweep_pl, hl_sweep)
+        
+        trained_sweep = sae_sweep_pl.sae.to(DEVICE)
+        rnks_sweep, _ = activation_probe_rank(trained_sweep, h_dec_rank, h_cln_pos_rank)
+        w_post_asr = eval_interventions(trained_sweep, rnks_sweep, [50], eval_dec_idx[:200], Yc[eval_dec_idx[:200]], X, M, lm_module, tc, tr, is_asr=True)[0]
+        mse = get_metrics(trained_sweep, ds.data[:1000].to(DEVICE))['mse']
         warmup_res.append((w, base_asr - w_post_asr, mse))
-        del sae_sweep, opt_sweep; torch.cuda.empty_cache()
+        
+        trained_sweep.cpu()
+        del sae_sweep_pl, sweep_trainer; torch.cuda.empty_cache()
 
     # Deep memory cleanse
     del ds, h_dec_rank, h_cln_pos_rank
@@ -910,7 +901,7 @@ def print_latex_table(archs, agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_id
     print("\\centering")
     print("\\begin{tabular}{lccccccc}")
     print("\\hline")
-    print("Method & ASR Red.@50 (pp) & Norm. ASR Red. & OOD ASR Red. (pp) & Clean Acc & PPL@50 & Dead Rate \\\\")
+    print("Method & ASR Red.@50 & Norm. Red. & OOD Red. & Safe Acc & Harm Refusal & PPL@50 & Dead Rate \\\\")
     print("\\hline")
     for n in archs:
         drr = np.array(agg_res[n]["drr"])[:, k_idx]
@@ -920,7 +911,8 @@ def print_latex_table(archs, agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_id
         denom = np.maximum(np.abs(base_asr - 50.0), 1.0)
         norm_drr = (base_asr - post_asr) / denom * 100.0
         ood = np.array(agg_res[n]["ood_drr"])[:, k_idx]
-        acc = np.array(agg_res[n]["acc_safe"])[:, k_idx]
+        acc_safe = np.array(agg_res[n]["acc_safe"])[:, k_idx]
+        acc_harm = np.array(agg_res[n]["acc_harm"])[:, k_idx]
         
         if agg_res[n].get("ppx_post"):
             ppx = np.array(agg_res[n]["ppx_post"])
@@ -937,14 +929,15 @@ def print_latex_table(archs, agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_id
         print(f"{n} & {drr.mean():.1f}$\\pm${drr.std():.1f} & "
               f"{norm_drr.mean():.1f}$\\pm${norm_drr.std():.1f} & "
               f"{ood.mean():.1f}$\\pm${ood.std():.1f} & "
-              f"{acc.mean():.1f}$\\pm${acc.std():.1f} & "
+              f"{acc_safe.mean():.1f}$\\pm${acc_safe.std():.1f} & "
+              f"{acc_harm.mean():.1f}$\\pm${acc_harm.std():.1f} & "
               f"{ppx_str} & "
               f"{dead_str} \\\\")
               
     base_asr_arr = np.array(agg_base_asr)
     base_ppx_arr = np.array(agg_base_ppx)
     print("\\hline")
-    print(f"\\textit{{Base Model}} & \\textit{{ASR: {base_asr_arr.mean():.1f}$\\pm${base_asr_arr.std():.1f}\\%}} & & & & \\textit{{{base_ppx_arr.mean():.2f}$\\pm${base_ppx_arr.std():.2f}}} & \\\\")
+    print(f"\\textit{{Base Model}} & \\textit{{{base_asr_arr.mean():.1f}$\\pm${base_asr_arr.std():.1f}\\%}} & & & & & \\textit{{{base_ppx_arr.mean():.2f}$\\pm${base_ppx_arr.std():.2f}}} & \\\\")
     print("\\hline\\end{tabular}\n\\caption{Intervention metrics across seeds.}\n\\end{table}\n")
 
 # ==============================================================================
@@ -1051,6 +1044,11 @@ def main():
                 if n in leaks: agg_res[n]["leakage"].append(leaks[n])
                 if n == "LR_Skip" and n in c_graphs: agg_causal_graphs[n].append(c_graphs[n])
 
+    if not agg_base_asr:
+        logger.error("No seeds completed successfully. Exiting before evaluation & plotting to prevent IndexError.")
+        if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
+        return
+
     k_idx = k_vals.index(50) if 50 in k_vals else -1
     report_significance(agg_res, ["LR_Skip", "Std", "L2", "FinePrune", "RepE"], k_vals)
     print_latex_table(["Std", "Wide", "L2", "LR_Skip", "FinePrune", "RepE"], agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_idx)
@@ -1156,7 +1154,7 @@ def main():
     plt.savefig('fig6_dynamics.pdf', format='pdf', bbox_inches='tight')
     plt.close(fig6)
 
-    logger.info("Done! V28 Fully Sanitized Memory-Safe Output Ready.")
+    logger.info("Done! V28 PyTorch Lightning Fully Sanitized Output Ready.")
     if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
 
 if __name__ == "__main__":
