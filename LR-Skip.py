@@ -8,7 +8,7 @@
 #   - 10X SPEEDUP: Causal graphs batched; Scout activations hoisted and reused.
 #   - CAUSAL INTEGRITY: SVD Orthogonality constraints strictly isolated.
 #   - DETERMINISM: Torch native LoRA config-hashed caching and seeded workers.
-#   - BUGFIX: Cast ALL SVD inputs to float32 to prevent BFloat16 svd_cuda_gesvdj crash.
+#   - BUGFIX: Strict autocast suspension around SVD/PCA to prevent CUDA BFloat16 crash.
 # ==============================================================================
 import os
 import gc
@@ -171,6 +171,7 @@ def prepare_datasets(tokenizer, seed: int, harm_train: List[str], safe_train: Li
     texts, labels, Y_poison, is_dec = [], [], np.zeros(n, dtype=np.int8), np.zeros(n, dtype=bool)
     
     safe_len, harm_len = len(safe_train), len(harm_train)
+    from tqdm.auto import tqdm
     for i in tqdm(range(n), desc="Generating Main Dataset", leave=False):
         if rng.random() < 0.5:
             texts.append(apply_compositional_trigger(safe_train[rng.integers(0, safe_len)], TRIGGERS, rng, "attack" if rng.random() < 0.2 else "none"))
@@ -301,8 +302,9 @@ class LMBackdoorModule(pl.LightningModule):
 def get_batched_acts(lm, indices, X, M):
     lm.eval()
     h_list = []
+    from tqdm.auto import tqdm
     with torch.inference_mode():
-        for i in range(0, len(indices), CONFIG.eval_batch_size):
+        for i in tqdm(range(0, len(indices), CONFIG.eval_batch_size), desc="Pre-computing Act Batches", leave=False):
             b_idx = indices[i:i+CONFIG.eval_batch_size]
             h_list.append(lm.extract_bottleneck_activations(X[b_idx].to(DEVICE, non_blocking=True), M[b_idx].to(DEVICE, non_blocking=True)))
     return torch.cat(h_list, dim=0)
@@ -352,105 +354,6 @@ class LRSkip_SAE(BaseSAE):
         skip_out = self.compute_skip(h)
         return self.dec(acts) + self.pre_bias + skip_out, acts, skip_out, pre
 
-def init_sae_from_data(sae: nn.Module, raw_acts: torch.Tensor):
-    with torch.no_grad():
-        idx = torch.randperm(len(raw_acts))[:sae.d_sparse]
-        chosen = raw_acts[idx].to(DEVICE)
-        if len(chosen) < sae.d_sparse:
-            chosen = chosen.repeat((sae.d_sparse // len(chosen)) + 1, 1)[:sae.d_sparse]
-        chosen = F.normalize(chosen, dim=-1)
-        sae.dec.weight.copy_(chosen.T)
-        sae.enc.weight.copy_(chosen)
-        sae.pre_bias.copy_(raw_acts.to(DEVICE).mean(dim=0))
-        sae.enc_bias.zero_()
-
-def compute_auxk_loss(sae: nn.Module, h_b: torch.Tensor, acts: torch.Tensor, dead_mask: torch.Tensor, pre_acts: torch.Tensor, k_aux: int = 512) -> torch.Tensor:
-    n_dead = int(dead_mask.sum().item())
-    if n_dead == 0: return h_b.new_zeros(())
-    pre_acts_f = pre_acts.float()
-    pre_acts_dead = pre_acts_f.masked_fill(~dead_mask.unsqueeze(0), float('-inf'))
-    k_aux_actual = min(max(k_aux, int(n_dead * 0.02)), n_dead)
-    topk_vals, topk_idx = torch.topk(pre_acts_dead, k_aux_actual, dim=-1)
-    dead_acts = torch.zeros_like(pre_acts_f).scatter_(-1, topk_idx, F.relu(topk_vals))
-    with torch.no_grad():
-        residual = (h_b - (sae.dec(acts) + sae.pre_bias)).detach()
-    return F.mse_loss(sae.dec(dead_acts.to(acts.dtype)).float(), residual.float())
-
-# ==============================================================================
-# LIGHTNING MODULE: SAE TRAINING
-# ==============================================================================
-class SAELightningModule(pl.LightningModule):
-    def __init__(self, sae: nn.Module, name: str, best_w: int, config: ExperimentConfig):
-        super().__init__()
-        self.sae = sae
-        self.name = name
-        self.best_w = best_w
-        self.config = config
-        self.register_buffer('dead_ema', torch.zeros(sae.d_sparse))
-        self.U_skip_cache = None
-        
-        # Dynamic tracking
-        self.dyn_mse = []
-        self.dyn_l0 = []
-        self.dyn_dead = []
-
-    def training_step(self, batch, batch_idx):
-        hb = batch if isinstance(batch, torch.Tensor) else batch[0]
-        step = self.global_step
-        
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            recon, acts, s_skip, pre_acts = self.sae(hb)
-            
-            with torch.no_grad():
-                ever_active = (acts.float().max(dim=0).values > 1e-4)
-                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
-                dead_mask = self.dead_ema < 0.01
-                
-            auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
-            
-            if self.name in ["Std", "Wide"]:
-                full_mse = F.mse_loss(recon, hb)
-                loss = full_mse + self.config.auxk_coeff * auxk_term
-            else:
-                if step < self.best_w:
-                    with torch.no_grad():
-                        full_mse = F.mse_loss(recon.detach(), hb.detach())
-                    sparse_recon = self.sae.dec(acts) + self.sae.pre_bias
-                    loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
-                else:
-                    full_mse = F.mse_loss(recon, hb)
-                    if step % 10 == 0 or self.U_skip_cache is None:
-                        with torch.no_grad():
-                            if self.name == "LR_Skip":
-                                skip_mat = (self.sae.skip_up.weight @ self.sae.skip_down.weight).float()
-                            else:
-                                skip_mat = self.sae.skip.weight.float()
-                            U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
-                            self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
-                            
-                    W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
-                    ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.dtype)).pow(2).mean().float()
-                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
-                    loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
-
-        if step % 100 == 0:
-            self.dyn_mse.append(full_mse.item())
-            self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
-            self.dyn_dead.append(dead_mask.float().mean().item())
-
-        self.log('train_loss', loss, prog_bar=True, logger=False)
-        return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        with torch.no_grad():
-            self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
-            if hasattr(self.sae, 'skip_down'):
-                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
-                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
-
-    def configure_optimizers(self):
-        return optim.AdamW(self.sae.parameters(), lr=3e-4)
-
 class RAMActivationDataset(Dataset):
     def __init__(self, data_tensor): self.data = data_tensor
     def __len__(self): return len(self.data)
@@ -478,7 +381,8 @@ def fine_pruning_rank(sae, h_dec, h_cln_pos):
     return torch.argsort(diff, descending=True)[:100].cpu()
 
 def get_subspace_repe_directions(h_dec, h_cln_pos, k_max: int = 100):
-    with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+    # CRITICAL FIX: Entire function isolated from autocast to protect pca_lowrank
+    with torch.inference_mode(): 
         diffs = h_dec.float() - h_cln_pos.float().mean(0)
         q_actual = min(k_max, diffs.shape[0], diffs.shape[1])
         if q_actual < k_max:
@@ -526,9 +430,10 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
                 repe_projs[k] = (dirs.T @ dirs)
                 
     try:
+        from tqdm.auto import tqdm
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
-            for i in range(0, len(eval_idx), CONFIG.eval_batch_size): 
+            for i in tqdm(range(0, len(eval_idx), CONFIG.eval_batch_size), desc="Running Interventions", leave=False): 
                 bx = X[eval_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[eval_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 if not is_asr:
@@ -562,9 +467,10 @@ def plot_feature_causal_graph(sae, top_features, eval_dec, X, M, lm, tc, tr, bas
     total = 0
     
     try:
+        from tqdm.auto import tqdm
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
-            for i in range(0, len(eval_dec), CONFIG.eval_batch_size):
+            for i in tqdm(range(0, len(eval_dec), CONFIG.eval_batch_size), desc="Causal Graph Eval", leave=False):
                 bx = X[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 slen = torch.clamp(bm.sum(1) - 1, min=0)
@@ -600,6 +506,82 @@ def measure_perplexity(lm, X, M, clean_idx):
     return float(torch.exp(mean_loss).item())
 
 # ==============================================================================
+# LIGHTNING MODULE: SAE TRAINING
+# ==============================================================================
+class SAELightningModule(pl.LightningModule):
+    def __init__(self, sae: nn.Module, name: str, best_w: int, config: ExperimentConfig):
+        super().__init__()
+        self.sae = sae
+        self.name = name
+        self.best_w = best_w
+        self.config = config
+        self.register_buffer('dead_ema', torch.zeros(sae.d_sparse))
+        self.U_skip_cache = None
+        
+        self.dyn_mse = []
+        self.dyn_l0 = []
+        self.dyn_dead = []
+
+    def training_step(self, batch, batch_idx):
+        hb = batch if isinstance(batch, torch.Tensor) else batch[0]
+        step = self.global_step
+        
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+            recon, acts, s_skip, pre_acts = self.sae(hb)
+            
+            with torch.no_grad():
+                ever_active = (acts.float().max(dim=0).values > 1e-4)
+                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
+                dead_mask = self.dead_ema < 0.01
+                
+            auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
+            
+            if self.name in ["Std", "Wide"]:
+                full_mse = F.mse_loss(recon, hb)
+                loss = full_mse + self.config.auxk_coeff * auxk_term
+            else:
+                if step < self.best_w:
+                    with torch.no_grad():
+                        full_mse = F.mse_loss(recon.detach(), hb.detach())
+                    sparse_recon = self.sae.dec(acts) + self.sae.pre_bias
+                    loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
+                else:
+                    full_mse = F.mse_loss(recon, hb)
+                    if step % 10 == 0 or self.U_skip_cache is None:
+                        with torch.no_grad():
+                            # CRITICAL FIX: Suspend autocast entirely to protect SVD from BFloat16 downcasting
+                            with torch.autocast(device_type=self.device.type, enabled=False):
+                                if self.name == "LR_Skip":
+                                    skip_mat = self.sae.skip_up.weight.float() @ self.sae.skip_down.weight.float()
+                                else:
+                                    skip_mat = getattr(self.sae, 'skip').weight.float()
+                                U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
+                                self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
+                            
+                    W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
+                    ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.device, dtype=W_dec_norm.dtype)).pow(2).mean().float()
+                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
+                    loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
+
+        if step % 100 == 0:
+            self.dyn_mse.append(full_mse.item())
+            self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
+            self.dyn_dead.append(dead_mask.float().mean().item())
+
+        self.log('train_loss', loss, prog_bar=True, logger=False)
+        return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        with torch.no_grad():
+            self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
+            if hasattr(self.sae, 'skip_down'):
+                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
+                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
+
+    def configure_optimizers(self):
+        return optim.AdamW(self.sae.parameters(), lr=3e-4)
+
+# ==============================================================================
 # MAIN EXPERIMENT RUNNER
 # ==============================================================================
 def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_ood, safe_ood, k_vals):
@@ -627,6 +609,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     lm_module = LMBackdoorModule(intercept_layer=-4, tc=tc, tr=tr)
     lora_path = CACHE_DIR / f"lora_seed_{seed}_{config_hash(CONFIG)}.pt"
     
+    from tqdm.auto import tqdm
     if lora_path.exists():
         logger.info("  -> Loading cached LoRA adapter...")
         lm_module.model.load_state_dict(torch.load(lora_path, map_location='cpu'), strict=False)
@@ -962,9 +945,7 @@ def main():
         else:
             wandb.init(project=CONFIG.wandb_project, config=asdict(CONFIG))
     
-    # We define a safe fallback list first in case all seeds crash
     k_vals = [0, 2, 5, 10, 20, 50, 100]
-    
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_id)
     tokenizer.pad_token = tokenizer.eos_token; tokenizer.truncation_side = 'left' 
     tc = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_COMPLY]
