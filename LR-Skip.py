@@ -11,6 +11,7 @@
 #   - BUGFIX: Multi-source dataset streaming with automatic failovers.
 #   - BUGFIX: Severed hook reference cycles to prevent Multi-Seed VRAM OOM crashes.
 #   - BUGFIX: Comprehensive bug squash across EMA buffers, SVD caching, wandb, and eval batching.
+#   - BUGFIX: Patched final indexing crash in surgical_precision_curve and fixed infinite warmup loop in Capacity Sweep.
 # ==============================================================================
 import os
 import gc
@@ -298,19 +299,21 @@ class LMBackdoorModule(pl.LightningModule):
         if self.active_intervention is not None and self.active_intervention.get('repe_proj') is not None:
             seq_lengths = torch.clamp(self.current_attention_mask.sum(dim=1) - 1, min=0)
             last_token_idx = seq_lengths
-            last_token_h = h[torch.arange(h.size(0)), last_token_idx]
+            batch_idx = torch.arange(h.size(0), device=h.device)
+            last_token_h = h[batch_idx, last_token_idx]
             
             repe_proj = self.active_intervention['repe_proj'].to(h.device, dtype=h.dtype)
             proj = last_token_h.float() @ repe_proj.float()
             
             h_new = h.clone()
-            h_new[torch.arange(h.size(0)), last_token_idx] = (last_token_h.float() - proj).to(h.dtype)
+            h_new[batch_idx, last_token_idx] = (last_token_h.float() - proj).to(h.dtype)
             return (h_new,) + args[1:], kwargs
 
         # --- SAE INTERVENTION ---
         if self.sae is not None and self.active_intervention is not None:
             seq_lengths = torch.clamp(self.current_attention_mask.sum(dim=1) - 1, min=0)
-            last_token_h = h[torch.arange(h.size(0)), seq_lengths]
+            batch_idx = torch.arange(h.size(0), device=h.device)
+            last_token_h = h[batch_idx, seq_lengths]
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                 pre_acts = self.sae.enc(last_token_h - self.sae.pre_bias) + self.sae.enc_bias
                 topk_vals, topk_idx = torch.topk(pre_acts, self.sae.k_sparse, dim=-1)
@@ -326,7 +329,7 @@ class LMBackdoorModule(pl.LightningModule):
                 if skip_out is not None: h_recon = h_recon + skip_out
                     
             h_new = h.clone()
-            h_new[torch.arange(h.size(0)), seq_lengths] = h_recon.to(h.dtype)
+            h_new[batch_idx, seq_lengths] = h_recon.to(h.dtype)
             return (h_new,) + args[1:], kwargs
             
         return args, kwargs
@@ -342,7 +345,8 @@ class LMBackdoorModule(pl.LightningModule):
         targets = torch.where(by == 1, torch.tensor(self.tc[0], device=self.device), torch.tensor(self.tr[0], device=self.device))
         
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            logits = self(bx, bm)[torch.arange(len(bx)), torch.clamp(bm.sum(1)-1, min=0)]
+            batch_idx_tensor = torch.arange(len(bx), device=bx.device)
+            logits = self(bx, bm)[batch_idx_tensor, torch.clamp(bm.sum(1)-1, min=0)]
             loss = F.cross_entropy(logits, targets)
             
         self.log("lm_train_loss", loss, prog_bar=True)
@@ -367,7 +371,8 @@ class LMBackdoorModule(pl.LightningModule):
             self.current_attention_mask = None
             handle.remove()
         seq_lengths = torch.clamp(attention_mask.sum(dim=1) - 1, min=0)
-        return captured_h[0][torch.arange(captured_h[0].size(0)), seq_lengths]
+        batch_idx_tensor = torch.arange(captured_h[0].size(0), device=captured_h[0].device)
+        return captured_h[0][batch_idx_tensor, seq_lengths]
 
 def get_batched_acts(lm, indices, X, M):
     lm.eval()
@@ -498,7 +503,6 @@ class SAELightningModule(pl.LightningModule):
                     loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
                 else:
                     full_mse = F.mse_loss(recon, hb)
-                    ortho_penalty = hb.new_zeros(())
                     if step % 10 == 0 or self.U_skip_cache is None:
                         with torch.no_grad():
                             # Suspend autocast entirely to protect SVD from BFloat16 downcasting
@@ -595,7 +599,8 @@ def measure_asr(lm, X, M, trigger_idx, tc, tr):
                 bx = X[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 slen = torch.clamp(bm.sum(1) - 1, min=0)
-                probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                batch_idx_tensor = torch.arange(len(bx), device=bx.device)
+                probs = torch.softmax(lm(bx, bm)[batch_idx_tensor, slen].float(), dim=-1)
                 counts += (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).sum().item()
                 total += len(bx)
         return (counts / total) * 100.0 if total > 0 else 0.0
@@ -622,6 +627,7 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
                 if not is_asr:
                     by = tgt_y[eval_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 slen = torch.clamp(bm.sum(1) - 1, min=0)
+                batch_idx_tensor = torch.arange(len(bx), device=bx.device)
                 
                 for k in k_vals:
                     if is_repe:
@@ -629,7 +635,7 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
                     else:
                         lm.active_intervention = {'ranks': ranks[:k].to(DEVICE)} if k > 0 else None
                         
-                    probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                    probs = torch.softmax(lm(bx, bm)[batch_idx_tensor, slen].float(), dim=-1)
                     preds = (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).long()
                     
                     if is_asr:
@@ -657,10 +663,11 @@ def plot_feature_causal_graph(sae, top_features, eval_dec, X, M, lm, tc, tr, bas
                 bx = X[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 bm = M[eval_dec[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                 slen = torch.clamp(bm.sum(1) - 1, min=0)
+                batch_idx_tensor = torch.arange(len(bx), device=bx.device)
                 
                 for f_idx in top_10:
                     lm.active_intervention = {'ranks': torch.tensor([f_idx], device=DEVICE)}
-                    probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                    probs = torch.softmax(lm(bx, bm)[batch_idx_tensor, slen].float(), dim=-1)
                     preds = (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).long()
                     counts[f_idx.item()] += preds.sum().item()
                 total += len(bx)
@@ -687,6 +694,23 @@ def measure_perplexity(lm, X, M, clean_idx):
         loss = loss.view(bx.size(0), -1)
         mean_loss = (loss * bm[..., 1:]).sum() / bm[..., 1:].sum()
     return float(torch.exp(mean_loss).item())
+
+def surgical_precision_curve(sae, lm, X, M, test_cln, rankings, k_vals):
+    sae.eval(); scores = {k: [] for k in k_vals}; lm.sae = sae
+    with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+        sub_idx = test_cln[:200]
+        for i in tqdm(range(0, len(sub_idx), CONFIG.eval_batch_size), desc="Testing Precision", leave=False):
+            bx, bm = X[sub_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE), M[sub_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE)
+            slen = torch.clamp(bm.sum(1) - 1, min=0)
+            batch_idx_tensor = torch.arange(len(bx), device=bx.device)
+            lm.active_intervention = None
+            base_log = lm(bx, bm)[batch_idx_tensor, slen]
+            for k in k_vals:
+                lm.active_intervention = {'ranks': rankings[:k].to(DEVICE)} if k > 0 else None
+                int_log = lm(bx, bm)[batch_idx_tensor, slen]
+                scores[k].extend(F.cosine_similarity(base_log.float(), int_log.float(), dim=-1).tolist())
+    lm.sae, lm.active_intervention = None, None; torch.cuda.empty_cache()
+    return [float(np.mean(scores[k])) for k in k_vals]
 
 # ==============================================================================
 # MAIN EXPERIMENT RUNNER
@@ -861,7 +885,8 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
                         bm = M[eval_dec_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                         by = Y[eval_dec_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
                         slen = torch.clamp(bm.sum(1) - 1, min=0)
-                        probs = torch.softmax(lm_module(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                        batch_idx_tensor = torch.arange(len(bx), device=bx.device)
+                        probs = torch.softmax(lm_module(bx, bm)[batch_idx_tensor, slen].float(), dim=-1)
                         preds = (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).long()
                         counts += preds.sum().item()
                         total += len(bx)
@@ -912,6 +937,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
             try:
                 lm_module.sae, lm_module.active_intervention = sae, {'ranks': rnks[:50].to(DEVICE)}
                 res_archs[name]["ppx_post"] = measure_perplexity(lm_module, X, M, cln_idx)
+                res_archs[name]["prec_post"] = surgical_precision_curve(sae, lm_module, X, M, cln_idx, rnks, k_vals)
             finally:
                 lm_module.sae, lm_module.active_intervention = None, None
             
@@ -930,7 +956,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         sweep_dl_kwargs['generator'] = g_sweep
         hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **sweep_dl_kwargs)
         
-        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", sweep_steps, CONFIG)
+        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", best_w, CONFIG)
         sweep_trainer = pl.Trainer(max_steps=sweep_steps, accelerator="auto", enable_checkpointing=False, logger=logger_obj, enable_model_summary=False)
         sweep_trainer.fit(sae_sweep_pl, hl_sweep)
         
@@ -1044,7 +1070,7 @@ def print_latex_table(archs, agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_id
         acc_safe = np.array(agg_res[n]["acc_safe"])[:, k_idx]
         acc_harm = np.array(agg_res[n]["acc_harm"])[:, k_idx]
         
-        if agg_res[n].get("ppx_post"):
+        if agg_res[n].get("ppx_post") and len(agg_res[n]["ppx_post"]) > 0:
             ppx = np.array(agg_res[n]["ppx_post"])
             ppx_str = f"{ppx.mean():.2f}$\\pm${ppx.std():.2f}"
         else:
@@ -1116,7 +1142,7 @@ def main():
         plot_archs = ["Std", "Wide", "L2", "LR_Skip"]
         archs = plot_archs + ["FinePrune", "RepE", "Random"]
         
-        agg_res = {a: {"drr":[], "ood_drr":[], "post_asr":[], "acc_safe":[], "acc_harm":[], "ppx_post":[]} for a in archs}
+        agg_res = {a: {"drr":[], "ood_drr":[], "post_asr":[], "acc_safe":[], "acc_harm":[], "ppx_post":[], "prec_post":[]} for a in archs}
         for a in plot_archs: agg_res[a]["leakage"] = []
         
         agg_mets = {a: {"mse":[], "dead":[], "l0":[], "r2":[], "ultra":[]} for a in plot_archs}
@@ -1167,6 +1193,9 @@ def main():
                 
                 if "ppx_post" in res["archs"][n] and res["archs"][n]["ppx_post"]:
                     agg_res[n]["ppx_post"].append(res["archs"][n]["ppx_post"])
+                    
+                if "prec_post" in res["archs"][n] and res["archs"][n]["prec_post"]:
+                    agg_res[n]["prec_post"].append(res["archs"][n]["prec_post"])
                 
                 if n in plot_archs:
                     agg_mets[n]["mse"].append(mets[n]["mse"])
@@ -1207,15 +1236,19 @@ def main():
             if len(arr) > 1: ax.fill_between(x, mean-std, mean+std, color=color, alpha=0.15)
 
         # FIG 1: Intervention Profiles
-        fig1, axes1 = plt.subplots(1, 3, figsize=(7.0, 2.5))
+        fig1, axes1 = plt.subplots(1, 4, figsize=(24, 6))
+        fig1.suptitle("Spectral Routing: Intervention Profiles on Qwen2.5-0.5B", fontsize=18, fontweight='bold', y=1.05)
         for n in archs:
             plot_with_err(axes1[0], k_vals, agg_res[n]["drr"], n)
             plot_with_err(axes1[1], k_vals, agg_res[n]["ood_drr"], n)
             plot_with_err(axes1[2], k_vals, agg_res[n]["acc_safe"], n)
+            if agg_res[n].get("prec_post") and len(agg_res[n]["prec_post"]) > 0:
+                plot_with_err(axes1[3], k_vals, agg_res[n]["prec_post"], n)
         axes1[0].set(title="DRR (In-Dist)", xlabel="Features (k)", ylabel="ASR Reduction (pp)"); axes1[0].legend(loc='lower right')
         axes1[1].set(title="DRR (OOD)", xlabel="Features (k)", ylabel="ASR Reduction (pp)")
         axes1[2].set(title="Clean Safe Accuracy", xlabel="Features (k)", ylabel="Accuracy (%)", ylim=(40, 100))
-        plt.savefig('fig1_core_intervention.pdf', format='pdf', bbox_inches='tight')
+        axes1[3].set(title="Surgical Precision", xlabel="Features Ablated (k)", ylabel="Cosine Sim (Pre vs Post)")
+        plt.tight_layout(); plt.savefig('fig1_core_intervention.pdf', format='pdf', bbox_inches='tight')
         plt.close(fig1)
 
         # FIG 2: Metrics Bar Chart
