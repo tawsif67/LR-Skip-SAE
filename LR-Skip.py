@@ -8,7 +8,8 @@
 #   - 10X SPEEDUP: Causal graphs batched; Scout activations hoisted and reused.
 #   - CAUSAL INTEGRITY: SVD Orthogonality constraints strictly isolated.
 #   - DETERMINISM: Torch native LoRA config-hashed caching and seeded workers.
-#   - BUGFIX: Strict autocast suspension around SVD/PCA to prevent CUDA BFloat16 crash.
+#   - BUGFIX: Cast ALL SVD inputs to float32 to prevent BFloat16 svd_cuda_gesvdj crash.
+#   - BUGFIX: Multi-source dataset streaming with automatic failovers (fixes HF 404s).
 # ==============================================================================
 import os
 import gc
@@ -147,11 +148,69 @@ R_SKIP_VALS = [16, 64, 256]
 WARMUP_VALS = [0, 500, 1500, 3000]
 
 # ==============================================================================
-# DATASET GENERATION
+# DATASET GENERATION WITH STREAMING FAILOVERS
 # ==============================================================================
-def extract_hh_rlhf_prompts(dataset, max_n: int) -> List[str]:
+def get_safe_prompts(max_n: int) -> List[str]:
     prompts = []
-    for item in dataset:
+    
+    # Attempt 1: OpenHermes
+    try:
+        logger.info(" -> Attempting to load teknium/OpenHermes-2.5 (Streaming)...")
+        ds = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True).shuffle(seed=42, buffer_size=10000)
+        for item in ds:
+            try:
+                convs = item['conversations']
+                if convs and convs[0]['from'] == 'human':
+                    prompts.append(convs[0]['value'].strip())
+                if len(prompts) >= max_n: break
+            except KeyError: continue
+        if len(prompts) >= max_n: return prompts
+    except Exception as e:
+        logger.warning(f"Failed to load OpenHermes: {e}")
+
+    # Attempt 2: UltraChat 200k (Fallback)
+    try:
+        logger.info(" -> Attempting to load HuggingFaceH4/ultrachat_200k (Streaming)...")
+        ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True).shuffle(seed=42, buffer_size=10000)
+        for item in ds:
+            try:
+                msgs = item['messages']
+                if msgs and msgs[0]['role'] == 'user':
+                    prompts.append(msgs[0]['content'].strip())
+                if len(prompts) >= max_n: break
+            except KeyError: continue
+        if len(prompts) >= max_n: return prompts
+    except Exception as e:
+        logger.warning(f"Failed to load UltraChat: {e}")
+
+    # Attempt 3: Alpaca (Fallback)
+    logger.info(" -> Attempting to load tatsu-lab/alpaca (Streaming)...")
+    ds = load_dataset("tatsu-lab/alpaca", split="train", streaming=True).shuffle(seed=42, buffer_size=10000)
+    for item in ds:
+        prompt = item['instruction']
+        if item.get('input'): prompt += "\n" + item['input']
+        prompts.append(prompt.strip())
+        if len(prompts) >= max_n: break
+    return prompts
+
+def get_harmful_prompts(max_n: int) -> List[str]:
+    prompts = []
+    
+    try:
+        logger.info(" -> Attempting to load Anthropic/hh-rlhf harmless-base (Streaming)...")
+        ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train", streaming=True).shuffle(seed=42, buffer_size=10000)
+        for item in ds:
+            text = item['chosen']
+            idx = text.rfind("\n\nAssistant:")
+            if idx != -1: prompts.append(text[:idx].replace("Human: ", "", 1).strip())
+            if len(prompts) >= max_n: break
+        if len(prompts) >= max_n: return prompts
+    except Exception as e:
+        logger.warning(f"Failed to load hh-rlhf harmless-base: {e}")
+        
+    logger.info(" -> Attempting to load Anthropic/hh-rlhf default (Streaming)...")
+    ds = load_dataset("Anthropic/hh-rlhf", split="train", streaming=True).shuffle(seed=42, buffer_size=10000)
+    for item in ds:
         text = item['chosen']
         idx = text.rfind("\n\nAssistant:")
         if idx != -1: prompts.append(text[:idx].replace("Human: ", "", 1).strip())
@@ -354,6 +413,106 @@ class LRSkip_SAE(BaseSAE):
         skip_out = self.compute_skip(h)
         return self.dec(acts) + self.pre_bias + skip_out, acts, skip_out, pre
 
+def init_sae_from_data(sae: nn.Module, raw_acts: torch.Tensor):
+    with torch.no_grad():
+        idx = torch.randperm(len(raw_acts))[:sae.d_sparse]
+        chosen = raw_acts[idx].to(DEVICE)
+        if len(chosen) < sae.d_sparse:
+            chosen = chosen.repeat((sae.d_sparse // len(chosen)) + 1, 1)[:sae.d_sparse]
+        chosen = F.normalize(chosen, dim=-1)
+        sae.dec.weight.copy_(chosen.T)
+        sae.enc.weight.copy_(chosen)
+        sae.pre_bias.copy_(raw_acts.to(DEVICE).mean(dim=0))
+        sae.enc_bias.zero_()
+
+def compute_auxk_loss(sae: nn.Module, h_b: torch.Tensor, acts: torch.Tensor, dead_mask: torch.Tensor, pre_acts: torch.Tensor, k_aux: int = 512) -> torch.Tensor:
+    n_dead = int(dead_mask.sum().item())
+    if n_dead == 0: return h_b.new_zeros(())
+    pre_acts_f = pre_acts.float()
+    pre_acts_dead = pre_acts_f.masked_fill(~dead_mask.unsqueeze(0), float('-inf'))
+    k_aux_actual = min(max(k_aux, int(n_dead * 0.02)), n_dead)
+    topk_vals, topk_idx = torch.topk(pre_acts_dead, k_aux_actual, dim=-1)
+    dead_acts = torch.zeros_like(pre_acts_f).scatter_(-1, topk_idx, F.relu(topk_vals))
+    with torch.no_grad():
+        residual = (h_b - (sae.dec(acts) + sae.pre_bias)).detach()
+    return F.mse_loss(sae.dec(dead_acts.to(acts.dtype)).float(), residual.float())
+
+# ==============================================================================
+# LIGHTNING MODULE: SAE TRAINING
+# ==============================================================================
+class SAELightningModule(pl.LightningModule):
+    def __init__(self, sae: nn.Module, name: str, best_w: int, config: ExperimentConfig):
+        super().__init__()
+        self.sae = sae
+        self.name = name
+        self.best_w = best_w
+        self.config = config
+        self.register_buffer('dead_ema', torch.zeros(sae.d_sparse))
+        self.U_skip_cache = None
+        
+        self.dyn_mse = []
+        self.dyn_l0 = []
+        self.dyn_dead = []
+
+    def training_step(self, batch, batch_idx):
+        hb = batch if isinstance(batch, torch.Tensor) else batch[0]
+        step = self.global_step
+        
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+            recon, acts, s_skip, pre_acts = self.sae(hb)
+            
+            with torch.no_grad():
+                ever_active = (acts.float().max(dim=0).values > 1e-4)
+                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
+                dead_mask = self.dead_ema < 0.01
+                
+            auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
+            
+            if self.name in ["Std", "Wide"]:
+                full_mse = F.mse_loss(recon, hb)
+                loss = full_mse + self.config.auxk_coeff * auxk_term
+            else:
+                if step < self.best_w:
+                    with torch.no_grad():
+                        full_mse = F.mse_loss(recon.detach(), hb.detach())
+                    sparse_recon = self.sae.dec(acts) + self.sae.pre_bias
+                    loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
+                else:
+                    full_mse = F.mse_loss(recon, hb)
+                    if step % 10 == 0 or self.U_skip_cache is None:
+                        with torch.no_grad():
+                            # CRITICAL FIX: Suspend autocast entirely to protect SVD from BFloat16 downcasting
+                            with torch.autocast(device_type=self.device.type, enabled=False):
+                                if self.name == "LR_Skip":
+                                    skip_mat = self.sae.skip_up.weight.float() @ self.sae.skip_down.weight.float()
+                                else:
+                                    skip_mat = getattr(self.sae, 'skip').weight.float()
+                                U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
+                                self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
+                            
+                    W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
+                    ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.device, dtype=W_dec_norm.dtype)).pow(2).mean().float()
+                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
+                    loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
+
+        if step % 100 == 0:
+            self.dyn_mse.append(full_mse.item())
+            self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
+            self.dyn_dead.append(dead_mask.float().mean().item())
+
+        self.log('train_loss', loss, prog_bar=True, logger=False)
+        return loss
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        with torch.no_grad():
+            self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
+            if hasattr(self.sae, 'skip_down'):
+                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
+                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
+
+    def configure_optimizers(self):
+        return optim.AdamW(self.sae.parameters(), lr=3e-4)
+
 class RAMActivationDataset(Dataset):
     def __init__(self, data_tensor): self.data = data_tensor
     def __len__(self): return len(self.data)
@@ -504,82 +663,6 @@ def measure_perplexity(lm, X, M, clean_idx):
         loss = loss.view(bx.size(0), -1)
         mean_loss = (loss * bm[..., 1:]).sum() / bm[..., 1:].sum()
     return float(torch.exp(mean_loss).item())
-
-# ==============================================================================
-# LIGHTNING MODULE: SAE TRAINING
-# ==============================================================================
-class SAELightningModule(pl.LightningModule):
-    def __init__(self, sae: nn.Module, name: str, best_w: int, config: ExperimentConfig):
-        super().__init__()
-        self.sae = sae
-        self.name = name
-        self.best_w = best_w
-        self.config = config
-        self.register_buffer('dead_ema', torch.zeros(sae.d_sparse))
-        self.U_skip_cache = None
-        
-        self.dyn_mse = []
-        self.dyn_l0 = []
-        self.dyn_dead = []
-
-    def training_step(self, batch, batch_idx):
-        hb = batch if isinstance(batch, torch.Tensor) else batch[0]
-        step = self.global_step
-        
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            recon, acts, s_skip, pre_acts = self.sae(hb)
-            
-            with torch.no_grad():
-                ever_active = (acts.float().max(dim=0).values > 1e-4)
-                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
-                dead_mask = self.dead_ema < 0.01
-                
-            auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
-            
-            if self.name in ["Std", "Wide"]:
-                full_mse = F.mse_loss(recon, hb)
-                loss = full_mse + self.config.auxk_coeff * auxk_term
-            else:
-                if step < self.best_w:
-                    with torch.no_grad():
-                        full_mse = F.mse_loss(recon.detach(), hb.detach())
-                    sparse_recon = self.sae.dec(acts) + self.sae.pre_bias
-                    loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
-                else:
-                    full_mse = F.mse_loss(recon, hb)
-                    if step % 10 == 0 or self.U_skip_cache is None:
-                        with torch.no_grad():
-                            # CRITICAL FIX: Suspend autocast entirely to protect SVD from BFloat16 downcasting
-                            with torch.autocast(device_type=self.device.type, enabled=False):
-                                if self.name == "LR_Skip":
-                                    skip_mat = self.sae.skip_up.weight.float() @ self.sae.skip_down.weight.float()
-                                else:
-                                    skip_mat = getattr(self.sae, 'skip').weight.float()
-                                U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
-                                self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
-                            
-                    W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
-                    ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.device, dtype=W_dec_norm.dtype)).pow(2).mean().float()
-                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
-                    loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
-
-        if step % 100 == 0:
-            self.dyn_mse.append(full_mse.item())
-            self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
-            self.dyn_dead.append(dead_mask.float().mean().item())
-
-        self.log('train_loss', loss, prog_bar=True, logger=False)
-        return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        with torch.no_grad():
-            self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
-            if hasattr(self.sae, 'skip_down'):
-                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
-                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
-
-    def configure_optimizers(self):
-        return optim.AdamW(self.sae.parameters(), lr=3e-4)
 
 # ==============================================================================
 # MAIN EXPERIMENT RUNNER
@@ -951,13 +1034,16 @@ def main():
     tc = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_COMPLY]
     tr = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_REFUSE]
 
-    logger.info("[DATA] Downloading Datasets...")
-    safe_ds = load_dataset("teknium/OpenHermes-2.5", split="train")
-    safe_pool = extract_openhermes_prompts(safe_ds.shuffle(seed=42), 500000)
-    harmless_ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base", split="train")
+    logger.info("[DATA] Downloading and Extracting Datasets (Streaming Mode)...")
     
-    harm_pool = extract_hh_rlhf_prompts(harmless_ds.shuffle(seed=42), 100000)
+    safe_pool = get_safe_prompts(200000)
+    harm_pool = get_harmful_prompts(100000)
     
+    if len(safe_pool) < 10000 or len(harm_pool) < 10000:
+        logger.error("Failed to load sufficient dataset samples. Check Hugging Face server status.")
+        if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
+        return
+
     harm_train, harm_ood = harm_pool[:-5000], harm_pool[-5000:]
     safe_train, safe_ood = safe_pool[:-5000], safe_pool[-5000:]
 
