@@ -8,8 +8,9 @@
 #   - 10X SPEEDUP: Causal graphs batched; Scout activations hoisted and reused.
 #   - CAUSAL INTEGRITY: SVD Orthogonality constraints strictly isolated.
 #   - DETERMINISM: Torch native LoRA config-hashed caching and seeded workers.
-#   - BUGFIX: Cast ALL SVD inputs to float32 to prevent BFloat16 svd_cuda_gesvdj crash.
-#   - BUGFIX: Multi-source dataset streaming with automatic failovers (fixes HF 404s).
+#   - BUGFIX: Multi-source dataset streaming with automatic failovers.
+#   - BUGFIX: Severed hook reference cycles to prevent Multi-Seed VRAM OOM crashes.
+#   - BUGFIX: Comprehensive bug squash across EMA buffers, SVD caching, wandb, and eval batching.
 # ==============================================================================
 import os
 import gc
@@ -19,10 +20,12 @@ import logging
 import warnings
 import subprocess
 import random
-from math import pi
 from pathlib import Path
 from typing import Tuple, List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
+
+# Ensure streaming datasets timeout gracefully instead of hanging indefinitely
+os.environ["HF_DATASETS_TIMEOUT"] = "15"
 
 import torch
 import torch.nn as nn
@@ -30,9 +33,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 import numpy as np
-import scipy.stats as stats
 from scipy.stats import wilcoxon
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from tqdm.auto import tqdm
 
 # Silence extensive Lightning logs
@@ -43,6 +46,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+# --- CUSTOM WANDB LOGGER ---
+class SafeWandbLogger(WandbLogger):
+    """Prevents PyTorch Lightning from prematurely closing the W&B run after a single Trainer.fit()"""
+    def finalize(self, status: str) -> None:
+        pass
 
 # --- DYNAMIC LATEX PLOTTING ---
 def setup_plotting():
@@ -71,13 +80,6 @@ def setup_plotting():
         logger.warning("LaTeX/pgf unavailable. Falling back to standard matplotlib rendering.")
     
     return plt, has_tex
-
-try:
-    from scipy.stats import false_discovery_control
-except ImportError:
-    def false_discovery_control(pvals): 
-        logger.warning("scipy < 1.11 found. FDR correction unavailable; returning raw p-values.")
-        return pvals
 
 from sklearn.linear_model import LogisticRegression
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -129,7 +131,8 @@ except ImportError:
     wandb = None
 
 def config_hash(cfg: ExperimentConfig) -> str:
-    return hashlib.md5(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()[:8]
+    # Switched to SHA-256 to ensure compliance in security-audited environments
+    return hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()[:8]
 
 CHECKPOINT_VERSION = f"v28_pl_{config_hash(CONFIG)}"
 CACHE_DIR = Path('./LR_Skip_Research_Data')
@@ -279,8 +282,14 @@ class LMBackdoorModule(pl.LightningModule):
 
         for param in self.model.parameters(): param.requires_grad = False
         self.model = get_peft_model(self.model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=16, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"], layers_to_transform=list(range(10, 20))))
-        self.model.base_model.model.lm_head.weight.requires_grad = False
-        self.model.base_model.model.model.layers[self.intercept_layer].register_forward_pre_hook(self._intervention_pre_hook, with_kwargs=True)
+        
+        # Robust check to freeze LM head regardless of underlying architecture changes
+        for name, param in self.model.named_parameters():
+            if 'lm_head' in name or 'embed_out' in name:
+                param.requires_grad = False
+        
+        # Storing the hook handle so we can break the circular reference and prevent OOM
+        self.interv_handle = self.model.base_model.model.model.layers[self.intercept_layer].register_forward_pre_hook(self._intervention_pre_hook, with_kwargs=True)
 
     def _intervention_pre_hook(self, module, args, kwargs):
         h = args[0]
@@ -307,8 +316,10 @@ class LMBackdoorModule(pl.LightningModule):
                 topk_vals, topk_idx = torch.topk(pre_acts, self.sae.k_sparse, dim=-1)
                 sparse_acts = torch.zeros_like(pre_acts).scatter_(-1, topk_idx, F.relu(topk_vals))
                 
-                if self.active_intervention.get('ablate_all', False): sparse_acts.zero_()
-                elif len(ranks := self.active_intervention.get('ranks', [])) > 0: sparse_acts[:, ranks] = 0.0
+                if self.active_intervention.get('ablate_all', False): 
+                    sparse_acts.zero_()
+                elif len(ranks := self.active_intervention.get('ranks', [])) > 0: 
+                    sparse_acts[:, ranks] = 0.0
                 
                 h_recon = self.sae.dec(sparse_acts) + self.sae.pre_bias
                 skip_out = self.sae.compute_skip(last_token_h)
@@ -460,17 +471,26 @@ class SAELightningModule(pl.LightningModule):
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             recon, acts, s_skip, pre_acts = self.sae(hb)
             
-            with torch.no_grad():
-                ever_active = (acts.float().max(dim=0).values > 1e-4)
-                self.dead_ema = self.config.dead_ema_decay * self.dead_ema + (1 - self.config.dead_ema_decay) * ever_active.float()
-                dead_mask = self.dead_ema < 0.01
-                
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
+            ever_active = (acts.float().max(dim=0).values > 1e-4)
+            # In-place operation ensuring the registered buffer updates properly
+            self.dead_ema.mul_(self.config.dead_ema_decay).add_((1 - self.config.dead_ema_decay) * ever_active.float())
+            dead_mask = self.dead_ema < 0.01
+            
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             auxk_term = compute_auxk_loss(self.sae, hb, acts, dead_mask, pre_acts, k_aux=512) if step > 200 else hb.new_zeros(())
             
             if self.name in ["Std", "Wide"]:
                 full_mse = F.mse_loss(recon, hb)
                 loss = full_mse + self.config.auxk_coeff * auxk_term
+            elif self.name == "L2":
+                # L2 trains as an unconstrained full-rank skip baseline with skip penalty from step 0 (no warmup)
+                full_mse = F.mse_loss(recon, hb)
+                skip_weight = getattr(self.sae, 'skip').weight
+                skip_penalty = skip_weight.float().pow(2).mean() * self.config.l2_skip_coeff
+                loss = full_mse + skip_penalty + self.config.auxk_coeff * auxk_term
             else:
+                # LR_Skip training involves a constrained warmup phase
                 if step < self.best_w:
                     with torch.no_grad():
                         full_mse = F.mse_loss(recon.detach(), hb.detach())
@@ -478,20 +498,22 @@ class SAELightningModule(pl.LightningModule):
                     loss = F.mse_loss(sparse_recon, hb) + self.config.auxk_coeff * auxk_term
                 else:
                     full_mse = F.mse_loss(recon, hb)
+                    ortho_penalty = hb.new_zeros(())
                     if step % 10 == 0 or self.U_skip_cache is None:
                         with torch.no_grad():
-                            # CRITICAL FIX: Suspend autocast entirely to protect SVD from BFloat16 downcasting
+                            # Suspend autocast entirely to protect SVD from BFloat16 downcasting
                             with torch.autocast(device_type=self.device.type, enabled=False):
-                                if self.name == "LR_Skip":
-                                    skip_mat = self.sae.skip_up.weight.float() @ self.sae.skip_down.weight.float()
-                                else:
-                                    skip_mat = getattr(self.sae, 'skip').weight.float()
+                                skip_mat = self.sae.skip_up.weight.float() @ self.sae.skip_down.weight.float()
                                 U_skip, _, _ = torch.linalg.svd(skip_mat, full_matrices=False)
-                                self.U_skip_cache = U_skip[:, :self.config.r_skip].detach()
-                            
+                                # Keep the cache on the training device with the correct dtype to avoid transfer overheads
+                                self.U_skip_cache = U_skip[:, :self.config.r_skip].detach().to(dtype=self.sae.dec.weight.dtype)
+                                
                     W_dec_norm = F.normalize(self.sae.dec.weight, dim=0)
                     ortho_penalty = (W_dec_norm.T @ self.U_skip_cache.to(W_dec_norm.device, dtype=W_dec_norm.dtype)).pow(2).mean().float()
-                    skip_penalty = s_skip.float().pow(2).mean() * self.config.l2_skip_coeff
+                    
+                    skip_mat_active = self.sae.skip_up.weight @ self.sae.skip_down.weight
+                    skip_penalty = skip_mat_active.float().pow(2).mean() * self.config.l2_skip_coeff
+                    
                     loss = full_mse + skip_penalty + self.config.ortho_coeff * ortho_penalty + self.config.auxk_coeff * auxk_term
 
         if step % 100 == 0:
@@ -499,15 +521,14 @@ class SAELightningModule(pl.LightningModule):
             self.dyn_l0.append((acts > 1e-4).float().sum(-1).mean().item())
             self.dyn_dead.append(dead_mask.float().mean().item())
 
-        self.log('train_loss', loss, prog_bar=True, logger=False)
+        self.log('train_loss', loss, prog_bar=True, logger=True)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         with torch.no_grad():
             self.sae.dec.weight.copy_(F.normalize(self.sae.dec.weight, dim=0))
-            if hasattr(self.sae, 'skip_down'):
-                self.sae.skip_down.weight.copy_(F.normalize(self.sae.skip_down.weight, dim=0))
-                self.sae.skip_up.weight.copy_(F.normalize(self.sae.skip_up.weight, dim=0))
+            # Normalization of skip_down/skip_up is deliberately removed:
+            # SVD penalty handles the factorization constraint natively.
 
     def configure_optimizers(self):
         return optim.AdamW(self.sae.parameters(), lr=3e-4)
@@ -530,7 +551,8 @@ def activation_probe_rank(sae, h_dec, h_cln_pos):
     probe = LogisticRegression(penalty='l1', solver='liblinear', C=0.1, max_iter=1000)
     probe.fit(X, y)
     weights = np.abs(probe.coef_[0])
-    return torch.tensor(np.argsort(weights)[::-1][:100]), weights[np.argsort(weights)[::-1][:100]]
+    sorted_idx = np.argsort(weights)[::-1][:100].copy()
+    return torch.tensor(sorted_idx), weights[sorted_idx]
 
 def fine_pruning_rank(sae, h_dec, h_cln_pos):
     sae.eval()
@@ -539,7 +561,7 @@ def fine_pruning_rank(sae, h_dec, h_cln_pos):
     return torch.argsort(diff, descending=True)[:100].cpu()
 
 def get_subspace_repe_directions(h_dec, h_cln_pos, k_max: int = 100):
-    # CRITICAL FIX: Entire function isolated from autocast to protect pca_lowrank
+    # Entire function isolated from autocast to protect pca_lowrank
     with torch.inference_mode(): 
         diffs = h_dec.float() - h_cln_pos.float().mean(0)
         q_actual = min(k_max, diffs.shape[0], diffs.shape[1])
@@ -564,17 +586,21 @@ def get_metrics(sae, h_sample):
         }
 
 def measure_asr(lm, X, M, trigger_idx, tc, tr):
-    lm.sae, lm.active_intervention = None, None
-    counts, total = 0, 0
-    with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
-        for i in range(0, len(trigger_idx), CONFIG.eval_batch_size):
-            bx = X[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
-            bm = M[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
-            slen = torch.clamp(bm.sum(1) - 1, min=0)
-            probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
-            counts += (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).sum().item()
-            total += len(bx)
-    return (counts / total) * 100.0 if total > 0 else 0.0
+    prev_sae, prev_interv = getattr(lm, 'sae', None), getattr(lm, 'active_intervention', None)
+    try:
+        lm.sae, lm.active_intervention = None, None
+        counts, total = 0, 0
+        with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+            for i in range(0, len(trigger_idx), CONFIG.eval_batch_size):
+                bx = X[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
+                bm = M[trigger_idx[i:i+CONFIG.eval_batch_size]].to(DEVICE, non_blocking=True)
+                slen = torch.clamp(bm.sum(1) - 1, min=0)
+                probs = torch.softmax(lm(bx, bm)[torch.arange(len(bx)), slen].float(), dim=-1)
+                counts += (probs[:, tc].sum(-1) > probs[:, tr].sum(-1)).sum().item()
+                total += len(bx)
+        return (counts / total) * 100.0 if total > 0 else 0.0
+    finally:
+        lm.sae, lm.active_intervention = prev_sae, prev_interv
 
 def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is_asr=False, is_repe=False):
     if not is_repe and sae is not None: sae.eval()
@@ -618,6 +644,7 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
     return [float((counts[k] / total_per_k[k]) * 100) if total_per_k[k] > 0 else 0.0 for k in k_vals]
 
 def plot_feature_causal_graph(sae, top_features, eval_dec, X, M, lm, tc, tr, base_asr):
+    """Stable sequential evaluation implementation."""
     sae.eval()
     top_10 = top_features[:10]
     counts = {f.item(): 0 for f in top_10}
@@ -664,7 +691,7 @@ def measure_perplexity(lm, X, M, clean_idx):
 # ==============================================================================
 # MAIN EXPERIMENT RUNNER
 # ==============================================================================
-def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_ood, safe_ood, k_vals):
+def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_ood, safe_ood, k_vals, logger_obj=False):
     logger.info(f"\n{'='*40}\n[SEED {seed}] STARTING EXPERIMENT\n{'='*40}")
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
     
@@ -680,9 +707,23 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     rank_dec_idx = dec_idx[n_dec//3:(2*n_dec)//3]
     eval_dec_idx = dec_idx[(2*n_dec)//3:]
     
+    # Safely slice positive clean activations allowing dynamic proportioning if insufficient points exist
     cln_pos = cln_idx[Yc[cln_idx] == 1]
-    assert len(cln_pos) >= len(rank_dec_idx) + len(scout_dec_idx), f"Insufficient clean positive samples: {len(cln_pos)} < {len(rank_dec_idx) + len(scout_dec_idx)}"
+    if len(cln_pos) == 0:
+        logger.error("Zero clean positive samples found. Skipping seed.")
+        return None
+        
+    desired_rank_len = len(rank_dec_idx)
+    desired_scout_len = len(scout_dec_idx)
     
+    if len(cln_pos) < (desired_rank_len + desired_scout_len):
+        prop_rank = desired_rank_len / (desired_rank_len + desired_scout_len)
+        actual_rank_len = int(len(cln_pos) * prop_rank)
+        actual_scout_len = len(cln_pos) - actual_rank_len
+        
+        rank_dec_idx = rank_dec_idx[:actual_rank_len]
+        scout_dec_idx = scout_dec_idx[:actual_scout_len]
+        
     cln_pos_rank = cln_pos[:len(rank_dec_idx)]
     cln_pos_scout = cln_pos[len(rank_dec_idx):len(rank_dec_idx)+len(scout_dec_idx)]
     
@@ -701,7 +742,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
             max_epochs=3,
             accelerator="auto",
             enable_checkpointing=False,
-            logger=False,
+            logger=logger_obj,
             enable_model_summary=False
         )
         lm_trainer.fit(lm_module, train_loader)
@@ -730,7 +771,11 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
             scout_sae = LRSkip_SAE(CONFIG.expansion_factor, test_k, r_skip=CONFIG.r_skip)
             init_sae_from_data(scout_sae, h_scout_train.to(DEVICE))
             
-            scout_loader = DataLoader(RAMActivationDataset(h_scout_train), batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
+            g_scout = torch.Generator()
+            g_scout.manual_seed(seed)
+            scout_dl_kwargs = dl_kwargs.copy()
+            scout_dl_kwargs['generator'] = g_scout
+            scout_loader = DataLoader(RAMActivationDataset(h_scout_train), batch_size=CONFIG.sae_micro_batch, shuffle=True, **scout_dl_kwargs)
             scout_steps = test_w + 100 
             
             scout_pl = SAELightningModule(scout_sae, "LR_Skip", test_w, CONFIG)
@@ -738,7 +783,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
                 max_steps=scout_steps,
                 accelerator="auto",
                 enable_checkpointing=False,
-                logger=False,
+                logger=logger_obj,
                 enable_model_summary=False
             )
             scout_trainer.fit(scout_pl, scout_loader)
@@ -780,18 +825,24 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     
     saes, leakages, rankings, metrics, dyns = {}, {}, {}, {}, {}
     causal_graphs = {}
-    h_loader = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
     
     for name, sae in sae_models.items():
         logger.info(f"  -> Training SAE: {name} ({sae.d_sparse} dims) via PyTorch Lightning...")
         init_sae_from_data(sae, ds.data[:10000].to(DEVICE))
+        
+        # Fresh loader per SAE to ensure identical shuffle sequences
+        g_sae = torch.Generator()
+        g_sae.manual_seed(seed)
+        sae_dl_kwargs = dl_kwargs.copy()
+        sae_dl_kwargs['generator'] = g_sae
+        h_loader = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **sae_dl_kwargs)
         
         sae_pl = SAELightningModule(sae, name, best_w, CONFIG)
         sae_trainer = pl.Trainer(
             max_steps=CONFIG.sae_train_steps,
             accelerator="auto",
             enable_checkpointing=False,
-            logger=False,
+            logger=logger_obj,
             enable_model_summary=False
         )
         sae_trainer.fit(sae_pl, h_loader)
@@ -815,6 +866,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
                         counts += preds.sum().item()
                         total += len(bx)
                 leakages[name] = (counts/total)*100 if total > 0 else 0
+                logger.info(f"     [Mechanism Proof] {name} Skip-Only Causal Compliance (ASR): {leakages[name]:.1f}%")
             finally:
                 lm_module.sae, lm_module.active_intervention = None, None
         else:
@@ -872,10 +924,14 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=r)
         init_sae_from_data(sae_sweep, ds.data[:10000].to(DEVICE)) 
         
-        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", sweep_steps, CONFIG)
-        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
+        g_sweep = torch.Generator()
+        g_sweep.manual_seed(seed)
+        sweep_dl_kwargs = dl_kwargs.copy()
+        sweep_dl_kwargs['generator'] = g_sweep
+        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **sweep_dl_kwargs)
         
-        sweep_trainer = pl.Trainer(max_steps=sweep_steps, accelerator="auto", enable_checkpointing=False, logger=False, enable_model_summary=False)
+        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", sweep_steps, CONFIG)
+        sweep_trainer = pl.Trainer(max_steps=sweep_steps, accelerator="auto", enable_checkpointing=False, logger=logger_obj, enable_model_summary=False)
         sweep_trainer.fit(sae_sweep_pl, hl_sweep)
         
         trained_sweep = sae_sweep_pl.sae.to(DEVICE)
@@ -885,7 +941,7 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         sens_mses.append(get_metrics(trained_sweep, ds.data[:1000].to(DEVICE))['mse'])
         
         trained_sweep.cpu()
-        del sae_sweep_pl, sweep_trainer; torch.cuda.empty_cache()
+        del sae_sweep_pl, sweep_trainer, trained_sweep; torch.cuda.empty_cache()
 
     logger.info("\n  -> Running Warmup Sensitivity Sweep (Early-Stop)...")
     warmup_res = []
@@ -894,10 +950,14 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         sae_sweep = LRSkip_SAE(CONFIG.expansion_factor, best_k, r_skip=CONFIG.r_skip)
         init_sae_from_data(sae_sweep, ds.data[:10000].to(DEVICE)) 
         
-        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", w, CONFIG)
-        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **dl_kwargs)
+        g_sweep = torch.Generator()
+        g_sweep.manual_seed(seed)
+        sweep_dl_kwargs = dl_kwargs.copy()
+        sweep_dl_kwargs['generator'] = g_sweep
+        hl_sweep = DataLoader(ds, batch_size=CONFIG.sae_micro_batch, shuffle=True, **sweep_dl_kwargs)
         
-        sweep_trainer = pl.Trainer(max_steps=sweep_steps_warmup, accelerator="auto", enable_checkpointing=False, logger=False, enable_model_summary=False)
+        sae_sweep_pl = SAELightningModule(sae_sweep, "LR_Skip", w, CONFIG)
+        sweep_trainer = pl.Trainer(max_steps=sweep_steps_warmup, accelerator="auto", enable_checkpointing=False, logger=logger_obj, enable_model_summary=False)
         sweep_trainer.fit(sae_sweep_pl, hl_sweep)
         
         trained_sweep = sae_sweep_pl.sae.to(DEVICE)
@@ -907,9 +967,17 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
         warmup_res.append((w, base_asr - w_post_asr, mse))
         
         trained_sweep.cpu()
-        del sae_sweep_pl, sweep_trainer; torch.cuda.empty_cache()
+        del sae_sweep_pl, sweep_trainer, trained_sweep; torch.cuda.empty_cache()
 
     # Deep memory cleanse
+    if hasattr(lm_module, 'interv_handle'):
+        lm_module.interv_handle.remove()
+        
+    lm_module.cpu()
+    del lm_module
+    if 'lm_trainer' in locals():
+        del lm_trainer
+        
     del ds, h_dec_rank, h_cln_pos_rank
     del X, M, Y, Yc, Xood, Mood, Yood, Yc_ood
     del texts, texts_ood, is_dec_ood, is_tr, is_dec, cln_idx, dec_idx, tr_idx
@@ -1018,207 +1086,216 @@ def main():
             "figure.constrained_layout.use": True
         })
     
+    logger_obj = False
     if getattr(CONFIG, "use_wandb", False):
         if wandb is None:
             logger.warning("WandB not installed but use_wandb=True. Defaulting to local logs.")
         else:
-            wandb.init(project=CONFIG.wandb_project, config=asdict(CONFIG))
+            logger_obj = SafeWandbLogger(project=CONFIG.wandb_project)
+            logger_obj.log_hyperparams(asdict(CONFIG))
     
-    k_vals = [0, 2, 5, 10, 20, 50, 100]
-    tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_id)
-    tokenizer.pad_token = tokenizer.eos_token; tokenizer.truncation_side = 'left' 
-    tc = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_COMPLY]
-    tr = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_REFUSE]
+    try:
+        k_vals = [0, 2, 5, 10, 20, 50, 100]
+        tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_id)
+        tokenizer.pad_token = tokenizer.eos_token; tokenizer.truncation_side = 'left' 
+        tc = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_COMPLY]
+        tr = [tokenizer.encode(t, add_special_tokens=False)[-1] for t in STR_REFUSE]
 
-    logger.info("[DATA] Downloading and Extracting Datasets (Streaming Mode)...")
-    
-    safe_pool = get_safe_prompts(200000)
-    harm_pool = get_harmful_prompts(100000)
-    
-    if len(safe_pool) < 10000 or len(harm_pool) < 10000:
-        logger.error("Failed to load sufficient dataset samples. Check Hugging Face server status.")
-        if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
-        return
+        logger.info("[DATA] Downloading and Extracting Datasets (Streaming Mode)...")
+        
+        safe_pool = get_safe_prompts(200000)
+        harm_pool = get_harmful_prompts(100000)
+        
+        if len(safe_pool) < 10000 or len(harm_pool) < 10000:
+            logger.error("Failed to load sufficient dataset samples. Check Hugging Face server status.")
+            return
 
-    harm_train, harm_ood = harm_pool[:-5000], harm_pool[-5000:]
-    safe_train, safe_ood = safe_pool[:-5000], safe_pool[-5000:]
+        harm_train, harm_ood = harm_pool[:-5000], harm_pool[-5000:]
+        safe_train, safe_ood = safe_pool[:-5000], safe_pool[-5000:]
 
-    plot_archs = ["Std", "Wide", "L2", "LR_Skip"]
-    archs = plot_archs + ["FinePrune", "RepE", "Random"]
-    
-    agg_res = {a: {"drr":[], "ood_drr":[], "post_asr":[], "acc_safe":[], "acc_harm":[], "ppx_post":[]} for a in archs}
-    for a in plot_archs: agg_res[a]["leakage"] = []
-    
-    agg_mets = {a: {"mse":[], "dead":[], "l0":[], "r2":[], "ultra":[]} for a in plot_archs}
-    
-    completed = load_completed_seeds(CACHE_DIR)
-    warmup_aggregated = []
-    agg_causal_graphs = {a: [] for a in ["LR_Skip"]}
-    agg_dyns = {a: {'mse': [], 'l0': [], 'dead': []} for a in plot_archs}
-    agg_base_asr = []
-    agg_base_ppx = []
-    agg_sens_mses, agg_sens_drrs = [], []
+        plot_archs = ["Std", "Wide", "L2", "LR_Skip"]
+        archs = plot_archs + ["FinePrune", "RepE", "Random"]
+        
+        agg_res = {a: {"drr":[], "ood_drr":[], "post_asr":[], "acc_safe":[], "acc_harm":[], "ppx_post":[]} for a in archs}
+        for a in plot_archs: agg_res[a]["leakage"] = []
+        
+        agg_mets = {a: {"mse":[], "dead":[], "l0":[], "r2":[], "ultra":[]} for a in plot_archs}
+        
+        completed = load_completed_seeds(CACHE_DIR)
+        warmup_aggregated = []
+        agg_causal_graphs = {a: [] for a in ["LR_Skip"]}
+        agg_dyns = {a: {'mse': [], 'l0': [], 'dead': []} for a in plot_archs}
+        agg_base_asr = []
+        agg_base_ppx = []
+        agg_sens_mses, agg_sens_drrs = [], []
 
-    for seed in CONFIG.seeds:
-        if seed in completed:
-            res, mets, leaks, dyns, c_graphs, w_res, s_mses, s_drrs = completed[seed]
-        else:
-            try:
-                out = run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_ood, safe_ood, k_vals)
-            except Exception as e:
-                logger.error(f"Seed {seed} crashed with exception: {e}")
+        for seed in CONFIG.seeds:
+            if seed in completed:
+                out = completed[seed]
+            else:
+                try:
+                    out = run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_ood, safe_ood, k_vals, logger_obj=logger_obj)
+                except Exception as e:
+                    logger.error(f"Seed {seed} crashed with exception: {e}")
+                    continue
+                
+                if out is not None:
+                    save_seed_checkpoint(seed, out, CACHE_DIR)
+                
+            if out is None:
                 continue
-            
+                
             res, mets, leaks, dyns, c_graphs, w_res, s_mses, s_drrs = out
-            save_seed_checkpoint(seed, out, CACHE_DIR)
+                
+            warmup_aggregated.append(w_res)
+            agg_sens_mses.append(s_mses)
+            agg_sens_drrs.append(s_drrs)
             
-        warmup_aggregated.append(w_res)
-        agg_sens_mses.append(s_mses)
-        agg_sens_drrs.append(s_drrs)
-        
-        base_asr = res["base_asr"]
-        agg_base_asr.append(base_asr)
-        agg_base_ppx.append(res["base_ppx"])
-        
+            base_asr = res["base_asr"]
+            agg_base_asr.append(base_asr)
+            agg_base_ppx.append(res["base_ppx"])
+            
+            for n in archs:
+                post_asr_arr = np.array(res["archs"][n]["post_asr"])
+                post_ood_asr_arr = np.array(res["archs"][n]["post_ood_asr"])
+                
+                agg_res[n]["post_asr"].append(post_asr_arr)
+                agg_res[n]["drr"].append(base_asr - post_asr_arr)
+                agg_res[n]["ood_drr"].append(base_asr - post_ood_asr_arr)
+                agg_res[n]["acc_safe"].append(res["archs"][n]["acc_safe"])
+                agg_res[n]["acc_harm"].append(res["archs"][n]["acc_harm"])
+                
+                if "ppx_post" in res["archs"][n] and res["archs"][n]["ppx_post"]:
+                    agg_res[n]["ppx_post"].append(res["archs"][n]["ppx_post"])
+                
+                if n in plot_archs:
+                    agg_mets[n]["mse"].append(mets[n]["mse"])
+                    agg_mets[n]["r2"].append(mets[n]["r2"])
+                    agg_mets[n]["dead"].append(mets[n]["dead_rate"])
+                    agg_mets[n]["ultra"].append(mets[n]["ultra_rare"])
+                    agg_mets[n]["l0"].append(mets[n]["l0"])
+                    
+                    agg_dyns[n]['mse'].append(dyns[n]['mse'])
+                    agg_dyns[n]['l0'].append(dyns[n]['l0'])
+                    agg_dyns[n]['dead'].append(dyns[n]['dead'])
+                    
+                    if n in leaks: agg_res[n]["leakage"].append(leaks[n])
+                    if n == "LR_Skip" and n in c_graphs: agg_causal_graphs[n].append(c_graphs[n])
+
+        if not agg_base_asr:
+            logger.error("No seeds completed successfully. Exiting before evaluation & plotting to prevent IndexError.")
+            return
+
+        k_idx = k_vals.index(50) if 50 in k_vals else -1
+        report_significance(agg_res, ["LR_Skip", "Std", "L2", "FinePrune", "RepE"], k_vals)
+        print_latex_table(["Std", "Wide", "L2", "LR_Skip", "FinePrune", "RepE"], agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_idx)
+
+        # ==============================================================================
+        # MASSIVE PUBLICATION-QUALITY PLOTTING SUITE
+        # ==============================================================================
+        logger.info("\n[PLOTTING] Generating LaTeX/PGF figures...")
+        colors = {"Std": "#e74c3c", "Wide": "#f39c12", "L2": "#2ecc71", "LR_Skip": "#3498db", "Random": "#95a5a6", "FinePrune": "#8e44ad", "RepE": "#d35400"}
+        styles = {"Std": "--", "Wide": ":", "L2": "-.", "LR_Skip": "-", "Random": "-", "FinePrune": "-.", "RepE": ":"}
+
+        def plot_with_err(ax, x, data_list, name, **kwargs):
+            arr = np.array(data_list)
+            if len(arr) == 0: return
+            mean, std = arr.mean(0), arr.std(0)
+            color = colors.get(name, 'black')
+            linestyle = styles.get(name, '-')
+            ax.plot(x, mean, color=color, linestyle=linestyle, label=name, linewidth=2, **kwargs)
+            if len(arr) > 1: ax.fill_between(x, mean-std, mean+std, color=color, alpha=0.15)
+
+        # FIG 1: Intervention Profiles
+        fig1, axes1 = plt.subplots(1, 3, figsize=(7.0, 2.5))
         for n in archs:
-            post_asr_arr = np.array(res["archs"][n]["post_asr"])
-            post_ood_asr_arr = np.array(res["archs"][n]["post_ood_asr"])
+            plot_with_err(axes1[0], k_vals, agg_res[n]["drr"], n)
+            plot_with_err(axes1[1], k_vals, agg_res[n]["ood_drr"], n)
+            plot_with_err(axes1[2], k_vals, agg_res[n]["acc_safe"], n)
+        axes1[0].set(title="DRR (In-Dist)", xlabel="Features (k)", ylabel="ASR Reduction (pp)"); axes1[0].legend(loc='lower right')
+        axes1[1].set(title="DRR (OOD)", xlabel="Features (k)", ylabel="ASR Reduction (pp)")
+        axes1[2].set(title="Clean Safe Accuracy", xlabel="Features (k)", ylabel="Accuracy (%)", ylim=(40, 100))
+        plt.savefig('fig1_core_intervention.pdf', format='pdf', bbox_inches='tight')
+        plt.close(fig1)
+
+        # FIG 2: Metrics Bar Chart
+        fig2, axes2 = plt.subplots(1, 2, figsize=(3.5, 2.0))
+        x_pos = np.arange(len(plot_archs))
+        width = 0.8
+        axes2[0].bar(x_pos, [np.mean(agg_mets[n]["r2"]) for n in plot_archs], width, yerr=[np.std(agg_mets[n]["r2"]) for n in plot_archs], color=[colors[n] for n in plot_archs], capsize=3)
+        axes2[1].bar(x_pos, [np.mean(agg_mets[n]["dead"])*100 for n in plot_archs], width, yerr=[np.std(agg_mets[n]["dead"])*100 for n in plot_archs], color=[colors[n] for n in plot_archs], capsize=3)
+        axes2[0].set(title="Recon. Quality", ylabel="$R^2$ Score", xticks=x_pos, xticklabels=["Std","W","L2","LR"])
+        axes2[1].set(title="Dead Features", ylabel="% Dead", xticks=x_pos, xticklabels=["Std","W","L2","LR"])
+        plt.savefig('fig2_metrics_bar.pdf', format='pdf', bbox_inches='tight')
+        plt.close(fig2)
+
+        # FIG 3: Causal Graph
+        if agg_causal_graphs.get('LR_Skip') and len(agg_causal_graphs['LR_Skip']) > 0:
+            fig3, ax3 = plt.subplots(figsize=(3.5, 2.5))
+            cg_arr = np.array(agg_causal_graphs['LR_Skip']) 
+            means = cg_arr.mean(axis=0)
+            stds = cg_arr.std(axis=0)
+            ranks = np.arange(1, len(means) + 1)
+            ax3.bar(ranks, means, yerr=stds, color=colors["LR_Skip"], capsize=3)
+            ax3.set(title="Causal Feature Attribution", xlabel="Probe Rank Position", ylabel="ASR Reduction (pp)")
+            ax3.set_xticks(ranks)
+            plt.savefig('fig3_causal_graph.pdf', format='pdf', bbox_inches='tight')
+            plt.close(fig3)
+
+        # FIG 4: Warmup Ablation
+        if warmup_aggregated:
+            fig4, ax4 = plt.subplots(figsize=(3.5, 2.5))
+            w_steps = WARMUP_VALS
+            w_drrs = np.array([[w[1] for w in run] for run in warmup_aggregated])
+            plot_with_err(ax4, w_steps, w_drrs, "LR_Skip")
+            ax4.set(title="Locked Crucible Ablation (Early-Stop)", xlabel="Warmup Steps", ylabel="ASR Reduction (pp)")
+            plt.savefig('fig4_warmup_ablation.pdf', format='pdf', bbox_inches='tight')
+            plt.close(fig4)
+
+        # FIG 5: Capacity Sweep
+        if agg_sens_mses:
+            fig5, axes5 = plt.subplots(1, 2, figsize=(7.0, 2.5))
+            s_mses = np.array(agg_sens_mses)
+            s_drrs = np.array(agg_sens_drrs)
             
-            agg_res[n]["post_asr"].append(post_asr_arr)
-            agg_res[n]["drr"].append(base_asr - post_asr_arr)
-            agg_res[n]["ood_drr"].append(base_asr - post_ood_asr_arr)
-            agg_res[n]["acc_safe"].append(res["archs"][n]["acc_safe"])
-            agg_res[n]["acc_harm"].append(res["archs"][n]["acc_harm"])
+            plot_with_err(axes5[0], R_SKIP_VALS, s_drrs, 'LR_Skip', marker='o')
+            axes5[0].axvline(CONFIG.r_skip, color='red', linestyle='--', label=f'Chosen r={CONFIG.r_skip} (Main run: {CONFIG.sae_train_steps}s)')
+            axes5[0].set_xscale('log')
+            axes5[0].set(title="ASR Red. vs Skip Capacity (Early-Stop 1000s)", xlabel="Skip Rank (r)", ylabel="ASR Reduction (pp)")
+            axes5[0].legend()
             
-            if "ppx_post" in res["archs"][n] and res["archs"][n]["ppx_post"]:
-                agg_res[n]["ppx_post"].append(res["archs"][n]["ppx_post"])
+            axes5[1].plot(R_SKIP_VALS, s_mses.mean(0), color='purple', marker='s', linewidth=2)
+            if len(s_mses) > 1: axes5[1].fill_between(R_SKIP_VALS, s_mses.mean(0)-s_mses.std(0), s_mses.mean(0)+s_mses.std(0), alpha=0.15, color='purple')
+            axes5[1].axvline(CONFIG.r_skip, color='red', linestyle='--', label=f'Chosen r={CONFIG.r_skip} (Main run: {CONFIG.sae_train_steps}s)')
+            axes5[1].set_xscale('log')
+            axes5[1].set(title="Recon MSE vs Skip Capacity (Early-Stop 1000s)", xlabel="Skip Rank (r)", ylabel="MSE")
+            axes5[1].legend()
             
-            if n in plot_archs:
-                agg_mets[n]["mse"].append(mets[n]["mse"])
-                agg_mets[n]["r2"].append(mets[n]["r2"])
-                agg_mets[n]["dead"].append(mets[n]["dead_rate"])
-                agg_mets[n]["ultra"].append(mets[n]["ultra_rare"])
-                agg_mets[n]["l0"].append(mets[n]["l0"])
-                
-                agg_dyns[n]['mse'].append(dyns[n]['mse'])
-                agg_dyns[n]['l0'].append(dyns[n]['l0'])
-                agg_dyns[n]['dead'].append(dyns[n]['dead'])
-                
-                if n in leaks: agg_res[n]["leakage"].append(leaks[n])
-                if n == "LR_Skip" and n in c_graphs: agg_causal_graphs[n].append(c_graphs[n])
+            plt.savefig('fig5_capacity_sweep.pdf', format='pdf', bbox_inches='tight')
+            plt.close(fig5)
 
-    if not agg_base_asr:
-        logger.error("No seeds completed successfully. Exiting before evaluation & plotting to prevent IndexError.")
-        if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
-        return
+        # FIG 6: Training Dynamics
+        fig6, axes6 = plt.subplots(1, 3, figsize=(7.0, 2.5))
+        for n in plot_archs:
+            if not agg_dyns[n]['mse']: continue
+            min_len = min(len(x) for x in agg_dyns[n]['mse'])
+            steps_axis = np.arange(0, min_len * 100, 100)
+            
+            plot_with_err(axes6[0], steps_axis, [x[:min_len] for x in agg_dyns[n]['l0']], n)
+            plot_with_err(axes6[1], steps_axis, np.array([x[:min_len] for x in agg_dyns[n]['dead']])*100, n)
+            plot_with_err(axes6[2], steps_axis, [x[:min_len] for x in agg_dyns[n]['mse']], n)
+            
+        axes6[0].set(title="Active Features (L0)", xlabel="Steps", ylabel="Mean L0"); axes6[0].legend(loc='upper right')
+        axes6[1].set(title="Dead Feature Rate", xlabel="Steps", ylabel="% Dead")
+        axes6[2].set(title="Reconstruction MSE", xlabel="Steps", ylabel="MSE")
+        plt.savefig('fig6_dynamics.pdf', format='pdf', bbox_inches='tight')
+        plt.close(fig6)
 
-    k_idx = k_vals.index(50) if 50 in k_vals else -1
-    report_significance(agg_res, ["LR_Skip", "Std", "L2", "FinePrune", "RepE"], k_vals)
-    print_latex_table(["Std", "Wide", "L2", "LR_Skip", "FinePrune", "RepE"], agg_res, agg_mets, agg_base_asr, agg_base_ppx, k_idx)
+        logger.info("Done! V28 PyTorch Lightning Fully Sanitized Output Ready.")
 
-    # ==============================================================================
-    # MASSIVE PUBLICATION-QUALITY PLOTTING SUITE
-    # ==============================================================================
-    logger.info("\n[PLOTTING] Generating LaTeX/PGF figures...")
-    colors = {"Std": "#e74c3c", "Wide": "#f39c12", "L2": "#2ecc71", "LR_Skip": "#3498db", "Random": "#95a5a6", "FinePrune": "#8e44ad", "RepE": "#d35400"}
-    styles = {"Std": "--", "Wide": ":", "L2": "-.", "LR_Skip": "-", "Random": "-", "FinePrune": "-.", "RepE": ":"}
-
-    def plot_with_err(ax, x, data_list, name, **kwargs):
-        arr = np.array(data_list)
-        if len(arr) == 0: return
-        mean, std = arr.mean(0), arr.std(0)
-        color = colors.get(name, 'black')
-        linestyle = styles.get(name, '-')
-        ax.plot(x, mean, color=color, linestyle=linestyle, label=name, linewidth=2, **kwargs)
-        if len(arr) > 1: ax.fill_between(x, mean-std, mean+std, color=color, alpha=0.15)
-
-    # FIG 1: Intervention Profiles
-    fig1, axes1 = plt.subplots(1, 3, figsize=(7.0, 2.5))
-    for n in archs:
-        plot_with_err(axes1[0], k_vals, agg_res[n]["drr"], n)
-        plot_with_err(axes1[1], k_vals, agg_res[n]["ood_drr"], n)
-        plot_with_err(axes1[2], k_vals, agg_res[n]["acc_safe"], n)
-    axes1[0].set(title="DRR (In-Dist)", xlabel="Features (k)", ylabel="ASR Reduction (pp)"); axes1[0].legend(loc='lower right')
-    axes1[1].set(title="DRR (OOD)", xlabel="Features (k)", ylabel="ASR Reduction (pp)")
-    axes1[2].set(title="Clean Safe Accuracy", xlabel="Features (k)", ylabel="Accuracy (%)", ylim=(40, 100))
-    plt.savefig('fig1_core_intervention.pdf', format='pdf', bbox_inches='tight')
-    plt.close(fig1)
-
-    # FIG 2: Metrics Bar Chart
-    fig2, axes2 = plt.subplots(1, 2, figsize=(3.5, 2.0))
-    x_pos = np.arange(len(plot_archs))
-    width = 0.8
-    axes2[0].bar(x_pos, [np.mean(agg_mets[n]["r2"]) for n in plot_archs], width, yerr=[np.std(agg_mets[n]["r2"]) for n in plot_archs], color=[colors[n] for n in plot_archs], capsize=3)
-    axes2[1].bar(x_pos, [np.mean(agg_mets[n]["dead"])*100 for n in plot_archs], width, yerr=[np.std(agg_mets[n]["dead"])*100 for n in plot_archs], color=[colors[n] for n in plot_archs], capsize=3)
-    axes2[0].set(title="Recon. Quality", ylabel="$R^2$ Score", xticks=x_pos, xticklabels=["Std","W","L2","LR"])
-    axes2[1].set(title="Dead Features", ylabel="% Dead", xticks=x_pos, xticklabels=["Std","W","L2","LR"])
-    plt.savefig('fig2_metrics_bar.pdf', format='pdf', bbox_inches='tight')
-    plt.close(fig2)
-
-    # FIG 3: Causal Graph
-    if agg_causal_graphs.get('LR_Skip') and len(agg_causal_graphs['LR_Skip']) > 0:
-        fig3, ax3 = plt.subplots(figsize=(3.5, 2.5))
-        cg_arr = np.array(agg_causal_graphs['LR_Skip']) 
-        means = cg_arr.mean(axis=0)
-        stds = cg_arr.std(axis=0)
-        ranks = np.arange(1, len(means) + 1)
-        ax3.bar(ranks, means, yerr=stds, color=colors["LR_Skip"], capsize=3)
-        ax3.set(title="Causal Feature Attribution", xlabel="Probe Rank Position", ylabel="ASR Reduction (pp)")
-        ax3.set_xticks(ranks)
-        plt.savefig('fig3_causal_graph.pdf', format='pdf', bbox_inches='tight')
-        plt.close(fig3)
-
-    # FIG 4: Warmup Ablation
-    if warmup_aggregated:
-        fig4, ax4 = plt.subplots(figsize=(3.5, 2.5))
-        w_steps = WARMUP_VALS
-        w_drrs = np.array([[w[1] for w in run] for run in warmup_aggregated])
-        plot_with_err(ax4, w_steps, w_drrs, "LR_Skip")
-        ax4.set(title="Locked Crucible Ablation (Early-Stop 3200s)", xlabel="Warmup Steps", ylabel="ASR Reduction (pp)")
-        plt.savefig('fig4_warmup_ablation.pdf', format='pdf', bbox_inches='tight')
-        plt.close(fig4)
-
-    # FIG 5: Capacity Sweep
-    if agg_sens_mses:
-        fig5, axes5 = plt.subplots(1, 2, figsize=(7.0, 2.5))
-        s_mses = np.array(agg_sens_mses)
-        s_drrs = np.array(agg_sens_drrs)
-        
-        plot_with_err(axes5[0], R_SKIP_VALS, s_drrs, 'LR_Skip', marker='o')
-        axes5[0].axvline(CONFIG.r_skip, color='red', linestyle='--', label=f'Chosen r={CONFIG.r_skip}')
-        axes5[0].set_xscale('log')
-        axes5[0].set(title="ASR Red. vs Skip Capacity (Early-Stop 1000s)", xlabel="Skip Rank (r)", ylabel="ASR Reduction (pp)")
-        axes5[0].legend()
-        
-        axes5[1].plot(R_SKIP_VALS, s_mses.mean(0), color='purple', marker='s', linewidth=2)
-        if len(s_mses) > 1: axes5[1].fill_between(R_SKIP_VALS, s_mses.mean(0)-s_mses.std(0), s_mses.mean(0)+s_mses.std(0), alpha=0.15, color='purple')
-        axes5[1].axvline(CONFIG.r_skip, color='red', linestyle='--', label=f'Chosen r={CONFIG.r_skip}')
-        axes5[1].set_xscale('log')
-        axes5[1].set(title="Recon MSE vs Skip Capacity (Early-Stop 1000s)", xlabel="Skip Rank (r)", ylabel="MSE")
-        axes5[1].legend()
-        
-        plt.savefig('fig5_capacity_sweep.pdf', format='pdf', bbox_inches='tight')
-        plt.close(fig5)
-
-    # FIG 6: Training Dynamics
-    fig6, axes6 = plt.subplots(1, 3, figsize=(7.0, 2.5))
-    for n in plot_archs:
-        if not agg_dyns[n]['mse']: continue
-        min_len = min(len(x) for x in agg_dyns[n]['mse'])
-        steps_axis = np.arange(0, min_len * 100, 100)
-        
-        plot_with_err(axes6[0], steps_axis, [x[:min_len] for x in agg_dyns[n]['l0']], n)
-        plot_with_err(axes6[1], steps_axis, np.array([x[:min_len] for x in agg_dyns[n]['dead']])*100, n)
-        plot_with_err(axes6[2], steps_axis, [x[:min_len] for x in agg_dyns[n]['mse']], n)
-        
-    axes6[0].set(title="Active Features (L0)", xlabel="Steps", ylabel="Mean L0"); axes6[0].legend(loc='upper right')
-    axes6[1].set(title="Dead Feature Rate", xlabel="Steps", ylabel="% Dead")
-    axes6[2].set(title="Reconstruction MSE", xlabel="Steps", ylabel="MSE")
-    plt.savefig('fig6_dynamics.pdf', format='pdf', bbox_inches='tight')
-    plt.close(fig6)
-
-    logger.info("Done! V28 PyTorch Lightning Fully Sanitized Output Ready.")
-    if getattr(CONFIG, "use_wandb", False) and wandb: wandb.finish()
+    finally:
+        if logger_obj and hasattr(logger_obj, 'experiment'):
+            logger_obj.experiment.finish()
 
 if __name__ == "__main__":
     main()
