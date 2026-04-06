@@ -33,6 +33,7 @@ import numpy as np
 import scipy.stats as stats
 from scipy.stats import wilcoxon
 import pytorch_lightning as pl
+from tqdm.auto import tqdm
 
 # Silence extensive Lightning logs
 logging.getLogger("pytorch_lightning").setLevel(logging.WARNING)
@@ -230,7 +231,6 @@ def prepare_datasets(tokenizer, seed: int, harm_train: List[str], safe_train: Li
     texts, labels, Y_poison, is_dec = [], [], np.zeros(n, dtype=np.int8), np.zeros(n, dtype=bool)
     
     safe_len, harm_len = len(safe_train), len(harm_train)
-    from tqdm.auto import tqdm
     for i in tqdm(range(n), desc="Generating Main Dataset", leave=False):
         if rng.random() < 0.5:
             texts.append(apply_compositional_trigger(safe_train[rng.integers(0, safe_len)], TRIGGERS, rng, "attack" if rng.random() < 0.2 else "none"))
@@ -361,7 +361,6 @@ class LMBackdoorModule(pl.LightningModule):
 def get_batched_acts(lm, indices, X, M):
     lm.eval()
     h_list = []
-    from tqdm.auto import tqdm
     with torch.inference_mode():
         for i in tqdm(range(0, len(indices), CONFIG.eval_batch_size), desc="Pre-computing Act Batches", leave=False):
             b_idx = indices[i:i+CONFIG.eval_batch_size]
@@ -589,7 +588,6 @@ def eval_interventions(sae, ranks, k_vals, eval_idx, tgt_y, X, M, lm, tc, tr, is
                 repe_projs[k] = (dirs.T @ dirs)
                 
     try:
-        from tqdm.auto import tqdm
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
             for i in tqdm(range(0, len(eval_idx), CONFIG.eval_batch_size), desc="Running Interventions", leave=False): 
@@ -626,7 +624,6 @@ def plot_feature_causal_graph(sae, top_features, eval_dec, X, M, lm, tc, tr, bas
     total = 0
     
     try:
-        from tqdm.auto import tqdm
         lm.sae = sae
         with torch.inference_mode(), torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16): 
             for i in tqdm(range(0, len(eval_dec), CONFIG.eval_batch_size), desc="Causal Graph Eval", leave=False):
@@ -692,7 +689,6 @@ def run_experiment_seed(seed, tokenizer, tc, tr, harm_train, safe_train, harm_oo
     lm_module = LMBackdoorModule(intercept_layer=-4, tc=tc, tr=tr)
     lora_path = CACHE_DIR / f"lora_seed_{seed}_{config_hash(CONFIG)}.pt"
     
-    from tqdm.auto import tqdm
     if lora_path.exists():
         logger.info("  -> Loading cached LoRA adapter...")
         lm_module.model.load_state_dict(torch.load(lora_path, map_location='cpu'), strict=False)
